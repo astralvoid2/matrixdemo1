@@ -165,8 +165,12 @@ float glyph(vec2 uv, uint gid)
  *  rows     : how many character rows fit on screen (sets the cell size)
  *  seed     : decorrelates layers so they don't share column patterns
  *  speedMul : layer speed multiplier (far = slower: parallax)
+ *  chaos    : 0..1, how infected this spot is by the virus (see infection())
+ *
+ * Returns rgb = the normal green rain, a = brightness of the virus's own
+ * "corrupted" glyphs. They're kept apart so main() can colour them differently.
  */
-vec3 rainLayer(vec2 frag, float rows, uint seed, float speedMul)
+vec4 rainLayer(vec2 frag, float rows, uint seed, float speedMul, float chaos)
 {
     float cellH = uResolution.y / rows;
     float cellW = cellH * CELL_ASPECT;
@@ -227,9 +231,16 @@ vec3 rainLayer(vec2 frag, float rows, uint seed, float speedMul)
     }
 
     // The head character mutates every frame-ish (fast flicker); others at their own rate.
-    float rate = head > 0.0 ? 14.0 : mutRate;
+    // Infected cells all scramble fast: the virus is rewriting the code.
+    float rate = head > 0.0 ? 14.0 : mix(mutRate, 18.0, chaos);
     uint  gid  = hashU(cellId ^ uint(floor(uTime * rate + toF(cellId) * 7.0)));
     float dots = glyph(local, gid);
+
+    /* VIRUS GLYPHS: infection fills the EMPTY space too. Each cell gets a
+     * random draw 12 times a second. The more infected the area, the more
+     * cells win and light up, so dark gaps between the streams crawl with
+     * corrupted characters. */
+    float corrupt = chaos * step(1.0 - 0.3 * chaos, hash2(cellId, uint(uTime * 12.0)));
 
     /* BEAT REACTION: heads flare on each kick, the haze breathes. The fall
      * speed boost is done on the CPU side via uRainTime (see main.c for why). */
@@ -238,7 +249,175 @@ vec3 rainLayer(vec2 frag, float rows, uint seed, float speedMul)
     c         += HEAD_COLOR  * dots * head * (1.3 + 1.0 * beat);
     c         += TRAIL_COLOR * haze * (0.07 + 0.08 * beat);
     c         += mix(TRAIL_COLOR, HEAD_COLOR, 0.5) * glow * (0.22 + 0.25 * beat);
-    return c;
+    return vec4(c, dots * corrupt);
+}
+
+/* ======================================================================== */
+/* BEAT STRUCTURE: turning "beats elapsed" into musical events                */
+/* ======================================================================== */
+/*
+ * The music (synth.c) is 4 beats per bar and 4 bars per phrase. The beat
+ * counter alone tells us where we are at every level:
+ *
+ *   beat   : fract(beats)            every kick           -> uBeat (CPU side)
+ *   bar    : mod(beats, 4)           every 4 kicks        -> PUNCH
+ *   phrase : mod(beats, 16)          every 16 kicks       -> VIRUS
+ *
+ * Bigger musical units get bigger visual events. That's what makes a hit
+ * feel "major": the eye learns the hierarchy just as the ear does.
+ *
+ *   ...beat 15.75: tear glitch (build-up) | beat 0: FLASH + SHAKE + VIRUS
+ */
+const float PHRASE      = 16.0;  // beats per phrase
+const float VIRUS_BEATS = 5.0;   // how long an infection lasts
+const vec3  VIRUS_COLOR = vec3(1.00, 0.10, 0.22);   // infected code
+const vec3  VIRUS_HOT   = vec3(1.00, 0.75, 0.80);   // infection front / corrupted glyphs
+
+// Exponential decays since the last bar / phrase downbeat. 1 on the hit, falls to ~0.
+float barPunch()  { return uBeatCount > 0.0 ? exp(-mod(uBeatCount, 4.0) * 3.0) : 0.0; }
+float phraseHit() { return uBeatCount > 0.0 ? exp(-mod(uBeatCount, PHRASE) * 2.5) : 0.0; }
+
+/*
+ * INFECTION. Returns x = how infected this pixel is (0 or 1), y = brightness
+ * of the infection's leading edge.
+ *
+ * The screen is split into BLOCKS of 2x2 near-layer character cells, so the
+ * infection eats whole characters and looks digital rather than smooth.
+ * For each block:
+ *
+ *   d      = distance from the outbreak origin + random jitter per block.
+ *            The jitter turns a perfect circle into a ragged, organic
+ *            spreading shape (a cheap "dissolve" trick).
+ *   radius = grows fast at first, then slows: 1 - exp(-t) shape.
+ *   block is infected while  d < radius  AND  t < healTime(block).
+ *
+ * healTime also depends on the jitter and on distance, so the infection
+ * breaks up block by block (and flickers just before each block heals) instead
+ * of vanishing at once. Every phrase gets a new origin from hashing the phrase
+ * number, so it never starts from the same spot twice in a row.
+ */
+vec2 infection(vec2 frag, out vec2 block)
+{
+    float t = mod(uBeatCount, PHRASE);   // beats since the phrase started
+    block = vec2(0.0);
+    if (uBeatCount <= 0.0 || t > VIRUS_BEATS) return vec2(0.0);
+
+    uint  ph     = uint(uBeatCount / PHRASE);           // which phrase we're in
+    float aspect = uResolution.x / uResolution.y;
+    // Outbreak origin in "screen height" units, y measured from the top.
+    vec2  origin = vec2(mix(0.2, 0.8, hash2(ph, 11u)) * aspect,
+                        mix(0.2, 0.8, hash2(ph, 12u)));
+
+    // Same cell grid as the near rain layer (34 rows), grouped 2x2.
+    float cellH = uResolution.y / 34.0;
+    vec2  cellSz = vec2(cellH * CELL_ASPECT, cellH);
+    vec2  g      = vec2(frag.x, uResolution.y - frag.y) / cellSz;
+    block        = floor(g / 2.0);
+    vec2  centre = (block * 2.0 + 1.0) * cellSz / uResolution.y;
+
+    float jitter = toF(hashU3(uint(int(block.x)), uint(int(block.y)), ph));
+    float d      = length(centre - origin) + jitter * 0.22;
+    float radius = 0.05 + 0.75 * (1.0 - exp(-t * 1.4));   // tops out around 0.8 screen heights
+    float heal   = 1.6 + jitter * 1.8 + d * 1.4;
+
+    if (d > radius || t > heal) return vec2(0.0);
+
+    // Dying blocks stutter on and off during their last half beat.
+    if (t > heal - 0.5 && hash2(uint(int(block.x * 31.0 + block.y)), uint(uBeatCount * 16.0)) > 0.5)
+        return vec2(0.0);
+
+    /* The front glows while the infection is still advancing. Scaling by
+     * exp(-1.4 t), which is proportional to the spread speed (the derivative
+     * of the radius), means it dims as the spread stalls, rather than leaving
+     * a permanent bright rim. */
+    float edge = (1.0 - smoothstep(0.0, 0.07, radius - d)) * exp(-t * 1.4);
+    return vec2(1.0, edge);
+}
+
+/* ======================================================================== */
+/* THE WHOLE IMAGE (before post-processing)                                   */
+/* ======================================================================== */
+/* It's a function so main() can call it several times at shifted positions
+ * for the RGB-split effect. */
+vec3 scene(vec2 frag)
+{
+    vec2  res    = uResolution;
+    float scale  = res.y / 720.0;        // pixel effects look the same at any resolution
+    float punch  = barPunch();
+    float hit    = phraseHit();
+
+    /* ZOOM PUNCH: scale the image around the centre for a moment. Dividing
+     * the coordinate makes the content BIGGER (we sample closer to the
+     * centre). Bars punch a little, phrases punch hard. */
+    vec2 centre = res * 0.5;
+    frag = centre + (frag - centre) / (1.0 + 0.025 * punch + 0.06 * hit);
+
+    /* SHAKE on phrase hits: a random offset that changes 24 times a beat,
+     * scaled by the decaying hit so it settles quickly. */
+    if (hit > 0.02) {
+        uint tick = uint(uBeatCount * 24.0);
+        frag += (vec2(hash2(tick, 1u), hash2(tick, 2u)) - 0.5) * 28.0 * scale * hit;
+    }
+
+    /* TEAR: during the last quarter-beat of every phrase, slice the screen
+     * into horizontal bands and shove some of them sideways. Moving the sample
+     * position before drawing is the cheapest possible "VHS tear". It's the
+     * build-up just before the virus hits. */
+    if (uBeatCount > 0.0 && mod(uBeatCount, PHRASE) > PHRASE - 0.25) {
+        uint band = uint(frag.y / (res.y / 28.0));
+        uint tick = uint(uBeatCount * 8.0);
+        if (hash2(band, tick) > 0.6) frag.x += (hash2(band, tick + 99u) - 0.5) * res.x * 0.08;
+    }
+
+    // ---- The virus ----
+    vec2 block;
+    vec2 inf = infection(frag, block);
+
+    /* GLITCH INSETS: inside the infection, a few big rectangles (10x4 cells)
+     * become "windows" showing the code from somewhere else: displaced sideways
+     * by a whole number of cells, drawn hot and striped like a corrupted video
+     * buffer. They re-roll 4 times per beat, so the windows jump around. */
+    bool inset = false;
+    if (inf.x > 0.0) {
+        uvec2 r    = uvec2(ivec2(floor(block / vec2(5.0, 2.0))));
+        uint  tick = uint(uBeatCount * 4.0);
+        float h    = toF(hashU3(r.x, r.y, tick));
+        if (h > 0.86) {
+            inset = true;
+            float cellW = res.y / 34.0 * CELL_ASPECT;
+            frag.x += floor((hash2(r.x ^ tick, r.y) - 0.5) * 24.0) * cellW;
+        }
+    }
+
+    // ---- Rain layers ----
+    // Far layer: small cells, slower, dim and slightly bluer (atmospheric depth).
+    vec3 col  = rainLayer(frag, 58.0, 0xA341316Cu, 0.55, 0.0).rgb * vec3(0.30, 0.38, 0.42);
+    // Near layer: big cells, full speed. Layers are light, so they ADD.
+    vec4 near = rainLayer(frag, 34.0, 0xC8013EA4u, 1.0, inf.x);
+    col += near.rgb;
+
+    // ---- Infected look ----
+    if (inf.x > 0.0) {
+        // Keep the brightness of the code, swap its colour to virus red...
+        float lum = dot(col, vec3(0.3, 0.6, 0.1));
+        col  = VIRUS_COLOR * lum * 1.5;
+        // ...add the corrupted glyphs growing in the empty space...
+        col += VIRUS_HOT * near.a * 0.9;
+        // ...a dim red backlight so infected areas read as a region...
+        col += VIRUS_COLOR * 0.06;
+        // ...and a hot leading edge where the infection is still spreading.
+        col += VIRUS_HOT * inf.y * 0.5;
+        // Insets: the displaced code glows hot on a striped red backing. The
+        // stripes (dark every 3rd pixel row) suggest a damaged framebuffer.
+        if (inset) {
+            float stripe = step(1.0, mod(gl_FragCoord.y, 3.0));
+            col = VIRUS_HOT * lum * 2.2 + VIRUS_COLOR * 0.10 * stripe;
+        }
+    }
+
+    // Phrase hit flash: red-pink that fades in about half a beat.
+    col += mix(VIRUS_COLOR, VIRUS_HOT, 0.4) * 0.3 * hit * hit;
+    return col;
 }
 
 /* ======================================================================== */
@@ -246,22 +425,21 @@ void main()
 {
     vec2 frag = gl_FragCoord.xy;
 
-    /* GLITCH: during the last quarter-beat of every 16-beat phrase (4 bars),
-     * slice the screen into horizontal bands and shove some of them sideways.
-     * Moving the sample position before drawing is the cheapest possible
-     * "VHS tear". It changes 8 times per beat, so it jitters. */
-    float phrase = mod(uBeatCount, 16.0);
-    if (uBeatCount > 0.0 && phrase > 15.75) {
-        uint band = uint(frag.y / (uResolution.y / 28.0));
-        uint tick = uint(uBeatCount * 8.0);
-        float h   = hash2(band, tick);
-        if (h > 0.6) frag.x += (hash2(band, tick + 99u) - 0.5) * uResolution.x * 0.08;
+    /* RGB SPLIT (chromatic aberration): render the scene three times with
+     * small horizontal offsets and take R from one, G from another, B from
+     * the third. Red and blue fringes peel apart, like a broken video cable.
+     * It costs 3x the work, so only do it while the punch is visible. Every
+     * pixel takes the same branch (it depends only on uniforms), so there's
+     * no divergence penalty on the GPU. */
+    float split = (6.0 * barPunch() + 22.0 * phraseHit()) * (uResolution.y / 720.0);
+    vec3 col;
+    if (split > 0.75) {
+        col.r = scene(frag + vec2(split, 0.0)).r;
+        col.g = scene(frag).g;
+        col.b = scene(frag - vec2(split, 0.0)).b;
+    } else {
+        col = scene(frag);
     }
-
-    // Far layer: small cells, slower, dim and slightly bluer (atmospheric depth).
-    vec3 col = rainLayer(frag, 58.0, 0xA341316Cu, 0.55) * vec3(0.30, 0.38, 0.42);
-    // Near layer: big cells, full speed. Layers are light, so they ADD.
-    col     += rainLayer(frag, 34.0, 0xC8013EA4u, 1.0);
 
     /* ---- Post-processing ---- */
     vec2 uv = frag / uResolution;
@@ -273,9 +451,6 @@ void main()
     // Scanlines: sin(pi*y) at pixel centres (y = n + 0.5) alternates +1/-1,
     // so every other line is 12% darker. A cheap CRT feel.
     col *= 0.94 + 0.06 * sin(gl_FragCoord.y * 3.14159265);
-
-    // Flash on the first beat of each 4-bar phrase.
-    if (mod(uBeatCount, 16.0) < 1.0) col += TRAIL_COLOR * 0.05 * uBeat;
 
     // Film grain: tiny per-pixel, per-frame noise. Also hides gradient banding.
     uint px = uint(gl_FragCoord.x) + uint(gl_FragCoord.y) * 4096u;

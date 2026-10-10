@@ -51,6 +51,7 @@ make track                       same as above, writes ./track.wav
 .
 ├── Makefile            build rules
 ├── README.md
+├── LICENSE
 ├── src/
 │   ├── main.c          window, GL context, shaders, main loop, beat uniforms
 │   ├── shader.frag     the Matrix rain (embedded into the binary at build time)
@@ -173,3 +174,7 @@ can see which GPU you got.
 * Make the bass pattern in `synth.c` change every 4 bars.
 * Size-code: strip the comments and pack the binary with `strip` + `upx`
   to see how close to a real 4K you can get.
+
+## License
+
+MIT. See [LICENSE](LICENSE). Use it, learn from it, remix it into your own intro.

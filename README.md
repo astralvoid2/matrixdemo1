@@ -1,5 +1,7 @@
 # MATRIX RAIN: a 4K-intro-style demo for Linux
 
+![Matrix digital rain: columns of procedural green glyphs falling at different speeds, with glowing lead characters](docs/screenshot.png)
+
 Falling green code, generated entirely in one fragment shader, synced to a
 128 BPM techno loop that is synthesised from scratch at startup. No textures,
 no fonts, no sample files: just math.
@@ -52,6 +54,7 @@ make track                       same as above, writes ./track.wav
 ├── Makefile            build rules
 ├── README.md
 ├── LICENSE
+├── docs/screenshot.png   README image
 ├── src/
 │   ├── main.c          window, GL context, shaders, main loop, beat uniforms
 │   ├── shader.frag     the Matrix rain (embedded into the binary at build time)

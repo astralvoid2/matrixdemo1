@@ -1,0 +1,6 @@
+# Build products (recreated by `make`)
+/build/
+/bin/
+
+# Exported / user-supplied audio
+*.wav

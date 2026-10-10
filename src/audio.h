@@ -25,6 +25,16 @@ int    audio_start_wav(const char *path);
  * fall back to a wall clock). */
 double audio_time(void);
 
+/* Queue length ALSA last reported, in seconds (for display). <0 if no audio. */
+double audio_reported_delay(void);
+
+/* Best guess of output latency that ALSA can't see (seconds). The visuals
+ * should run this far BEHIND audio_time(). See audio.c for the story. */
+double audio_hidden_latency_guess(void);
+
+const char *audio_backend_name(void);   /* short description for the HUD */
+unsigned    audio_rate(void);           /* sample rate in Hz, 0 if no audio */
+
 void   audio_set_mute(int mute);
 int    audio_get_mute(void);
 void   audio_stop(void);

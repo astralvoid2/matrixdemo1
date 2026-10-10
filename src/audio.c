@@ -52,6 +52,7 @@ static pthread_mutex_t g_clk_mtx = PTHREAD_MUTEX_INITIALIZER;
 static long long       g_clk_frames;
 static double          g_clk_stamp;  /* CLOCK_MONOTONIC seconds at measurement */
 static int             g_clk_valid;
+static long            g_last_delay;  /* frames ALSA said were queued (for the HUD) */
 
 static double now_sec(void)
 {
@@ -100,11 +101,16 @@ static void *audio_thread(void *arg)
          *    (still sitting in the buffers between us and the speaker), so
          *    frames actually heard = written - delay. */
         snd_pcm_sframes_t delay = 0;
-        if (snd_pcm_delay(g_pcm, &delay) < 0) delay = 0;
+        if (snd_pcm_delay(g_pcm, &delay) < 0) continue;
+        /* Some plugins return garbage (a huge number) on the very first call,
+         * before the stream is really running. A queue longer than a few
+         * seconds is impossible here, so skip the update. */
+        if (delay < 0 || delay > (snd_pcm_sframes_t)g_rate * 2) continue;
         long long heard = written - delay;
         if (heard < 0) heard = 0;
 
         pthread_mutex_lock(&g_clk_mtx);
+        g_last_delay = delay;
         g_clk_frames = heard;
         g_clk_stamp  = now_sec();
         g_clk_valid  = 1;
@@ -320,6 +326,47 @@ double audio_time(void)
     last = t;
     return t;
 }
+
+double audio_reported_delay(void)
+{
+    if (!g_pcm) return -1.0;
+    pthread_mutex_lock(&g_clk_mtx);
+    double d = (double)g_last_delay / g_rate;
+    pthread_mutex_unlock(&g_clk_mtx);
+    return d;
+}
+
+/*
+ * HIDDEN LATENCY. snd_pcm_delay() is only as honest as the layer below us.
+ * Talking straight to hardware (type HW), it's exact. On a desktop, "default"
+ * is usually an I/O PLUGIN (type IOPLUG) that forwards to PulseAudio, which on
+ * Ubuntu 22.04+ is really PipeWire's PulseAudio emulation. That emulation
+ * reports 0 us of latency for every stream, so the plugin's delay only
+ * counts its OWN buffer and misses PipeWire's queue, the graph quantum
+ * (1024 samples = 21 ms) and the sound card's buffer.
+ *
+ * Measured on a Meteor Lake laptop by recording the screen and the speaker
+ * monitor together: visuals led the kicks by ~116 ms. So for plugin outputs
+ * we assume this much extra, unreported latency by default. The user can fine-tune
+ * it live with [ and ] (Bluetooth headphones add another 100-200 ms).
+ */
+double audio_hidden_latency_guess(void)
+{
+    if (!g_pcm) return 0.0;
+    return snd_pcm_type(g_pcm) == SND_PCM_TYPE_IOPLUG ? 0.110 : 0.0;
+}
+
+const char *audio_backend_name(void)
+{
+    if (!g_pcm) return "off";
+    switch (snd_pcm_type(g_pcm)) {
+    case SND_PCM_TYPE_IOPLUG: return "ALSA->plugin (PulseAudio/PipeWire)";
+    case SND_PCM_TYPE_HW:     return "ALSA hw";
+    default:                  return "ALSA";
+    }
+}
+
+unsigned audio_rate(void) { return g_pcm ? g_rate : 0; }
 
 void audio_set_mute(int mute) { atomic_store(&g_mute, mute); }
 int  audio_get_mute(void)     { return atomic_load(&g_mute); }

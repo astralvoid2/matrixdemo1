@@ -16,6 +16,7 @@ typedef struct {
     unsigned    audio_rate;     /* Hz, 0 = no audio */
     double      alsa_delay_ms;  /* what ALSA reports as queued */
     double      sync_ms;        /* how far visuals run behind the audio clock */
+    const char *sync_source;    /* "auto", "saved" or "--sync-ms"            */
     int         muted;
     double      bpm, beats;     /* beats = the beat position the VISUALS use */
     int         other_gpu;      /* 1 if G can switch to another GPU */

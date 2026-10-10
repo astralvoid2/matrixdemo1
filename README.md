@@ -39,7 +39,8 @@ inside it, so it can be copied anywhere.
 | `M`          | mute / unmute (visual sync keeps running)                  |
 | `R`          | hot-reload `src/shader.frag` (run from the repo root)      |
 | `H`          | toggle the HUD: FPS, GPU, audio latency, sync, beat/phrase meters |
-| `[` / `]`    | nudge audio/visual sync by -/+ 10 ms (shown in the HUD)    |
+| `[` / `]`    | nudge audio/visual sync by -/+ 10 ms (hold to sweep). **Remembered** between runs |
+| `Backspace`  | forget the remembered sync, back to the automatic value    |
 | `G`          | relaunch on the other GPU (Intel/AMD and NVIDIA, see below) |
 
 ### Command-line options
@@ -48,7 +49,7 @@ inside it, so it can be copied anywhere.
 ./bin/demo --fullscreen          start fullscreen
 ./bin/demo --nosound             no audio (visuals use the wall clock)
 ./bin/demo --hud                 start with the HUD visible
-./bin/demo --sync-ms 150         delay the visuals 150 ms (e.g. Bluetooth headphones)
+./bin/demo --sync-ms 150         delay the visuals 150 ms (overrides the remembered value)
 ./bin/demo --wav track.wav --bpm 140 [--offset 0.25]   play your own track
 ./bin/demo --export track.wav    save the built-in music as a WAV and exit
 make track                       same as above, writes ./track.wav
@@ -117,10 +118,24 @@ recording the screen and the speaker monitor at the same time: the visuals
 were **~116 ms (a quarter beat) ahead** of the kicks.
 
 The fix: when the output is such a plugin, the visuals run **110 ms behind**
-the audio clock by default. Re-measured afterwards: **−3 ms**. Other outputs add
-their own latency (Bluetooth headphones add 100–250 ms, some HDMI TVs more),
-so it's adjustable: `[` / `]` in 10 ms steps while watching the HUD's beat
-meter, then make it permanent with `--sync-ms N`.
+the audio clock by default. Re-measured afterwards: **+9 ms** on the Intel
+GPU, **+34 ms** on the NVIDIA GPU (PRIME offload copies each frame over to the
+Intel display, which adds about a frame and a half).
+
+**Measured sync isn't always felt sync.** The beat flash jumps to full
+brightness on the kick, then fades over about a fifth of a beat. The eye weighs
+the whole glow, so the flash *feels* like it happens near the middle of the fade
+(about 94 ms after it starts), while a kick is heard at its sharp attack. On top
+of that, we're used to sound arriving after light. So many people prefer the
+visuals noticeably early: on the development laptop, a sync of **0 ms** felt
+best even though +110 ms measures as exact.
+
+So it's adjustable and **remembered**. Tune with `[` / `]` while watching the
+HUD's beat meter, and the value is saved to `~/.config/matrixrain/sync_ms`
+(or `$XDG_CONFIG_HOME/matrixrain/sync_ms`) and used on the next start. The HUD
+shows where the current value came from: `auto`, `saved` or `--sync-ms`.
+`Backspace` forgets it. Bluetooth headphones add 100–250 ms more, and some HDMI
+TVs more again.
 
 ### Replacing the music with your own track (e.g. from a music-generation model)
 
@@ -208,6 +223,7 @@ falls back to the integrated GPU.
 | Integrating speed instead of `time * speed`    | `main.c`, RAIN TIME comment                    |
 | Audio latency & the music clock                | `audio.c`, `audio_thread()` and `audio_time()` |
 | Hidden PipeWire latency, sync offset           | `audio.c` `audio_hidden_latency_guess()`, `main.c` MASTER CLOCK |
+| Saving settings the Linux way (XDG config dir) | `main.c`, `sync_file_path()`                   |
 | Bitmap-font HUD, blending a second pass        | `hud.c`                                        |
 | Switching GPU by re-exec'ing with PRIME variables | `main.c`, `relaunch_on_other_gpu()`         |
 | Kick/clap/hat/bass synthesis, SVF filter, sidechain | `synth.c`                                 |

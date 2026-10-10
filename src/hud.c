@@ -202,7 +202,8 @@ void hud_draw(const HudInfo *in, int fb_w, int fb_h)
 
     c = text(0, r, DIM, "SYNC  ");
     c = text(c, r, HI, "%+4.0f ms", in->sync_ms);
-    text(c, r++, DIM, "  visual delay (hidden audio latency)");
+    c = text(c, r, DIM, "  visual delay  ");
+    text(c, r++, MID, "%.12s", in->sync_source ? in->sync_source : "");
 
     /* Musical position: bar.beat, a 4-box beat meter and a 16-step phrase bar. */
     double b = in->beats < 0 ? 0 : in->beats;
@@ -226,8 +227,8 @@ void hud_draw(const HudInfo *in, int fb_w, int fb_h)
     r++;
 
     /* Footer: the keys. */
-    text(0, r, DIM, "keys: H hud  M mute  [ ] sync  F fullscreen%s",
-         in->other_gpu ? "  G switch GPU" : "");
+    text(0, r, DIM, "keys: H hud  M mute  [ ] sync  BkSp auto  F full%s",
+         in->other_gpu ? "  G GPU" : "");
 
     /* Upload and draw. Scale 2x at 720p, 3x at 1080p, and so on. */
     int scale = fb_h / 360 < 1 ? 1 : fb_h / 360;

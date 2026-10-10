@@ -48,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "audio.h"
@@ -94,9 +95,78 @@ static int g_switch_gpu;          /* G: quit and relaunch on the other GPU      
 
 /* SYNC OFFSET (seconds): how far the visuals run BEHIND the audio clock. It
  * makes up for output latency that ALSA can't see (see audio.c,
- * audio_hidden_latency_guess). [ and ] adjust it live, --sync-ms sets it. */
-static double g_sync;
-static int    g_sync_given;       /* 1 if --sync-ms was on the command line */
+ * audio_hidden_latency_guess), and for taste: a flash that fades out is
+ * PERCEIVED around the middle of its glow, so many people prefer the
+ * visuals a little early. Where the value comes from, highest priority first:
+ *   --sync-ms N    command line
+ *   saved          ~/.config/matrixrain/sync_ms, written whenever [ or ] is pressed
+ *   auto           audio_hidden_latency_guess()
+ * Backspace forgets the saved value and goes back to auto. */
+static double      g_sync;
+static int         g_sync_given;      /* 1 if --sync-ms was on the command line */
+static const char *g_sync_source = "auto";
+
+/* ---- Remembering the sync offset between runs ----
+ * Linux convention (the XDG Base Directory spec): per-user settings live in
+ * $XDG_CONFIG_HOME, which defaults to ~/.config. One small file per setting
+ * keeps the parsing trivial. */
+static int sync_file_path(char *buf, size_t len, int make_dir)
+{
+    const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    char dir[512];
+    if (xdg && *xdg)  snprintf(dir, sizeof dir, "%s/matrixrain", xdg);
+    else if (home)    snprintf(dir, sizeof dir, "%s/.config/matrixrain", home);
+    else              return -1;
+    if (make_dir) {
+        /* mkdir fails harmlessly if it already exists. ~/.config itself may
+         * be missing on a fresh account, so create the parent first. */
+        char parent[512];
+        snprintf(parent, sizeof parent, "%s", dir);
+        char *slash = strrchr(parent, '/');
+        if (slash) { *slash = '\0'; mkdir(parent, 0755); }
+        mkdir(dir, 0755);
+    }
+    snprintf(buf, len, "%s/sync_ms", dir);
+    return 0;
+}
+
+static int load_saved_sync(double *sec)
+{
+    char path[600];
+    if (sync_file_path(path, sizeof path, 0) != 0) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    double ms;
+    int ok = fscanf(f, "%lf", &ms) == 1;
+    fclose(f);
+    if (ok) *sec = ms / 1000.0;
+    return ok;
+}
+
+static void save_sync(void)
+{
+    char path[600];
+    if (sync_file_path(path, sizeof path, 1) != 0) return;
+    FILE *f = fopen(path, "w");
+    if (!f) { perror(path); return; }
+    fprintf(f, "%.0f\n", g_sync * 1000.0);
+    fclose(f);
+}
+
+static void forget_saved_sync(void)
+{
+    char path[600];
+    if (sync_file_path(path, sizeof path, 0) == 0) unlink(path);
+}
+
+/* [ / ] handler: adjust, remember, report. */
+static void nudge_sync(double delta)
+{
+    g_sync += delta;
+    g_sync_source = "saved";
+    save_sync();
+    fprintf(stderr, "sync: %+.0f ms (saved)\n", g_sync * 1000.0);
+}
 
 /* ------------------------------------------------------------------------- */
 /* Shader compilation                                                         */
@@ -220,7 +290,11 @@ static void toggle_fullscreen(GLFWwindow *win)
 static void on_key(GLFWwindow *win, int key, int scancode, int action, int mods)
 {
     (void)scancode; (void)mods;
-    if (action != GLFW_PRESS) return;
+    /* Holding a key sends PRESS, then REPEATs. Only the sync keys act on
+     * repeat (hold [ to sweep the offset); toggles like H and F must not
+     * flicker on and off while held. */
+    int repeatable = key == GLFW_KEY_LEFT_BRACKET || key == GLFW_KEY_RIGHT_BRACKET;
+    if (action == GLFW_RELEASE || (action == GLFW_REPEAT && !repeatable)) return;
     switch (key) {
     case GLFW_KEY_ESCAPE:
     case GLFW_KEY_Q:   glfwSetWindowShouldClose(win, GLFW_TRUE); break;
@@ -230,8 +304,14 @@ static void on_key(GLFWwindow *win, int key, int scancode, int action, int mods)
     case GLFW_KEY_R:   g_reload_requested = 1; break; /* do GL work in the main loop */
     case GLFW_KEY_H:   g_hud_on = !g_hud_on; break;
     /* [ and ] by physical key position (US layout names). Visuals later / earlier. */
-    case GLFW_KEY_LEFT_BRACKET:  g_sync -= 0.010; break;
-    case GLFW_KEY_RIGHT_BRACKET: g_sync += 0.010; break;
+    case GLFW_KEY_LEFT_BRACKET:  nudge_sync(-0.010); break;
+    case GLFW_KEY_RIGHT_BRACKET: nudge_sync(+0.010); break;
+    case GLFW_KEY_BACKSPACE:
+        forget_saved_sync();
+        g_sync = audio_hidden_latency_guess();
+        g_sync_source = "auto";
+        fprintf(stderr, "sync: back to auto, %+.0f ms\n", g_sync * 1000.0);
+        break;
     case GLFW_KEY_G:   g_switch_gpu = 1; glfwSetWindowShouldClose(win, GLFW_TRUE); break;
     }
 }
@@ -282,9 +362,13 @@ static void relaunch_on_other_gpu(char **argv, int on_nvidia)
     }
     if (g_hud_on)     args[n++] = "--hud";
     if (g_fullscreen) args[n++] = "--fullscreen";
-    snprintf(sync_buf, sizeof sync_buf, "%.0f", g_sync * 1000.0);
-    args[n++] = "--sync-ms";
-    args[n++] = sync_buf;
+    /* A saved or auto offset re-derives itself in the new process. Only an
+     * explicit --sync-ms (possibly nudged since) needs passing on. */
+    if (g_sync_given) {
+        snprintf(sync_buf, sizeof sync_buf, "%.0f", g_sync * 1000.0);
+        args[n++] = "--sync-ms";
+        args[n++] = sync_buf;
+    }
     args[n] = NULL;
 
     fprintf(stderr, "relaunching on the %s GPU...\n", on_nvidia ? "integrated (Mesa)" : "NVIDIA");
@@ -301,11 +385,13 @@ static void usage(const char *argv0)
            "  --bpm N             tempo of --wav track for beat sync (default %.0f)\n"
            "  --offset S          seconds until the first beat in --wav track (default 0)\n"
            "  --nosound           no audio (visuals run on the wall clock)\n"
-           "  --sync-ms N         visual delay vs. the audio clock in ms (default: auto)\n"
+           "  --sync-ms N         visual delay vs. the audio clock in ms\n"
+           "                      (default: last value set with [ ], else auto)\n"
            "  --hud               start with the HUD visible\n"
            "  --export FILE.wav   write the built-in track to a WAV file and exit\n"
            "keys: ESC/Q quit, F/F11 fullscreen, M mute, R reload shader.frag,\n"
-           "      H HUD, [ ] sync -/+ 10 ms, G relaunch on the other GPU\n",
+           "      H HUD, [ ] sync -/+ 10 ms (remembered), Backspace sync auto,\n"
+           "      G relaunch on the other GPU\n",
            argv0, DEMO_BPM);
 }
 
@@ -320,7 +406,8 @@ int main(int argc, char **argv)
         if      (!strcmp(a, "--fullscreen"))       start_fullscreen = 1;
         else if (!strcmp(a, "--nosound"))          nosound = 1;
         else if (!strcmp(a, "--hud"))              g_hud_on = 1;
-        else if (!strcmp(a, "--sync-ms") && more)  { g_sync = atof(argv[++i]) / 1000.0; g_sync_given = 1; }
+        else if (!strcmp(a, "--sync-ms") && more)  { g_sync = atof(argv[++i]) / 1000.0; g_sync_given = 1;
+                                                     g_sync_source = "--sync-ms"; }
         else if (!strcmp(a, "--wav")    && more)   wav = argv[++i];
         else if (!strcmp(a, "--bpm")    && more)   g_bpm = atof(argv[++i]);
         else if (!strcmp(a, "--offset") && more)   g_offset = atof(argv[++i]);
@@ -403,8 +490,12 @@ int main(int argc, char **argv)
         if (rc != 0) fprintf(stderr, "audio unavailable, continuing silently\n");
     }
     /* Default visual delay: whatever latency the audio layer can't report. */
-    if (!g_sync_given) g_sync = audio_hidden_latency_guess();
-    fprintf(stderr, "sync: visuals delayed %.0f ms vs the audio clock ([ / ] to adjust)\n", g_sync * 1000.0);
+    if (!g_sync_given) {
+        if (load_saved_sync(&g_sync)) g_sync_source = "saved";
+        else                          g_sync = audio_hidden_latency_guess();
+    }
+    fprintf(stderr, "sync: visuals delayed %.0f ms vs the audio clock (%s; [ / ] to adjust)\n",
+            g_sync * 1000.0, g_sync_source);
     double wall_start = glfwGetTime();
 
     /* ---- Main loop --------------------------------------------------------- */
@@ -475,6 +566,7 @@ int main(int argc, char **argv)
                 .audio_rate = audio_rate(),
                 .alsa_delay_ms = audio_reported_delay() * 1000.0,
                 .sync_ms = g_sync * 1000.0,
+                .sync_source = g_sync_source,
                 .muted = audio_get_mute(),
                 .bpm = g_bpm, .beats = beats,
                 .other_gpu = other_gpu,

@@ -1,6 +1,6 @@
 # MATRIX RAIN: a 4K-intro-style demo for Linux
 
-![Matrix digital rain with the HUD open (FPS, GPU, audio sync, beat and phrase meters) as a red virus outbreak breaks up into scattered blocks](docs/screenshot.png)
+![Matrix digital rain with the HUD open (executable size, FPS, memory, GPU, audio delay and auto-sync, beat and phrase meters) as a red virus outbreak breaks up into scattered blocks](docs/screenshot.png)
 
 *HUD on (`H`), a few beats after a phrase hit: the red virus is breaking up and the green code is taking back over.*
 
@@ -184,6 +184,41 @@ numbers (it's not system RAM).
 
 `./bin/demo --export ref.wav` gives you the built-in loop as a WAV, handy as a
 style or tempo reference when prompting a music model.
+
+## Sharing the binary
+
+`bin/demo` isn't fully self-contained. It loads these shared libraries at
+startup (`objdump -p bin/demo | grep NEEDED`):
+
+| Library | Ubuntu package (runtime, not `-dev`) | On a normal desktop? |
+|---------|--------------------------------------|----------------------|
+| `libglfw.so.3`   | `libglfw3`       | **usually not**, install it |
+| `libGL.so.1`     | `libgl1`         | yes                         |
+| `libasound.so.2` | `libasound2t64`  | yes                         |
+| `libc`, `libm`   | `libc6`          | yes                         |
+
+So on another **Ubuntu 24.04 (or newer) x86-64 desktop**, the recipient needs:
+
+```sh
+sudo apt install libglfw3
+./demo
+```
+
+(Checked in a clean `ubuntu:24.04` container: before installing the libraries,
+`ldd` reports GLFW, GL and ALSA as missing; after installing them, nothing is.)
+
+**Older systems won't run it.** Built on 24.04, it requires **glibc 2.38**
+(`objdump -T bin/demo | grep GLIBC_2.3`), e.g. for `fmod` and the C23
+`sscanf`. Ubuntu 22.04 ships glibc 2.35 and fails with
+`GLIBC_2.38 not found`. glibc is backward compatible, not forward, so to
+support older distros, **build on the oldest one you want to support**
+(e.g. inside an `ubuntu:22.04` container). Other distros (Fedora, Arch…) work
+if their glibc is new enough and they have GLFW installed. Different CPU
+architectures (ARM) need a rebuild.
+
+The most portable option is still the source: `git clone` + `make` takes
+seconds. For sharing a ready-made binary, attach it to a GitHub Release
+together with the one-line `apt install` above.
 
 ## GPU selection (hybrid laptops), drivers and display servers
 

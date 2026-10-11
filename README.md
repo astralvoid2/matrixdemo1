@@ -4,12 +4,32 @@
 
 *HUD on (`H`), a few beats after a phrase hit: the red virus is breaking up and the green code is taking back over.*
 
-Falling green code, generated entirely in one fragment shader, synced to a
-128 BPM techno loop that is synthesised from scratch at startup. No textures,
-no fonts, no sample files: just math.
+Falling green code, generated entirely in a GLSL fragment shader (plus a
+small post-processing pass), synced to a 128 BPM techno loop that is
+synthesised from scratch at startup. No textures, no fonts, no sample files:
+just math.
 
 The code is written to be **read**. Every file is commented for learning,
 explaining the shader math, the timing, OpenGL setup on Linux, and audio.
+
+## Download (no build needed)
+
+**[⬇ Get the latest release](https://github.com/astralvoid2/matrixdemo1/releases/latest)**: a single ~75 KB executable for x86-64 Linux.
+
+| File | Runs on |
+|------|---------|
+| `matrixrain-ubuntu22.04` | Ubuntu 22.04, 24.04 and newer (pick this one if unsure) |
+| `matrixrain-ubuntu24.04` | Ubuntu 24.04 and newer |
+
+```sh
+sudo apt install libglfw3                # one-time: the windowing library
+chmod +x matrixrain-ubuntu22.04
+./matrixrain-ubuntu22.04                 # add --fullscreen, or press F
+```
+
+Each file was built in a clean container of that Ubuntu release. `SHA256SUMS`
+on the release page lets you verify the download (`sha256sum -c SHA256SUMS`).
+Other distros: build from source below (it takes seconds).
 
 ## Build & run (Ubuntu 22.04 / 24.04 or newer)
 
@@ -245,6 +265,10 @@ numbers (it's not system RAM).
 style or tempo reference when prompting a music model.
 
 ## Sharing the binary
+
+Ready-made builds are on the [Releases page](https://github.com/astralvoid2/matrixdemo1/releases/latest)
+(see [Download](#download-no-build-needed)). This section explains what a
+binary needs, if you build and share your own.
 
 `bin/demo` isn't fully self-contained. It loads these shared libraries at
 startup (`objdump -p bin/demo | grep NEEDED`):

@@ -93,18 +93,20 @@ static int g_reload_requested;
 static int g_hud_on;              /* H toggles the overlay                        */
 static int g_switch_gpu;          /* G: quit and relaunch on the other GPU         */
 
-/* SYNC OFFSET (seconds): how far the visuals run BEHIND the audio clock. It
- * makes up for output latency that ALSA can't see (see audio.c,
- * audio_hidden_latency_guess), and for taste: a flash that fades out is
- * PERCEIVED around the middle of its glow, so many people prefer the
- * visuals a little early. Where the value comes from, highest priority first:
+/* SYNC. The visual clock is
+ *     audio_time() + audio_smoothed_delay() - g_sync
+ * The middle term is AUTOMATIC: it follows whatever latency ALSA reports, so
+ * speakers and Bluetooth headphones both line up without any setup (see
+ * audio.c for how this was found). g_sync is a personal TRIM on top,
+ * in seconds (positive = visuals later). Where it comes from, highest
+ * priority first:
  *   --sync-ms N    command line
- *   saved          ~/.config/matrixrain/sync_ms, written whenever [ or ] is pressed
- *   auto           audio_hidden_latency_guess()
- * Backspace forgets the saved value and goes back to auto. */
+ *   saved          ~/.config/matrixrain/sync_trim_ms, written on every [ or ]
+ *   default        0
+ * Backspace forgets the saved trim. */
 static double      g_sync;
 static int         g_sync_given;      /* 1 if --sync-ms was on the command line */
-static const char *g_sync_source = "auto";
+static const char *g_sync_source = "default";
 
 /* ---- Remembering the sync offset between runs ----
  * Linux convention (the XDG Base Directory spec): per-user settings live in
@@ -126,7 +128,9 @@ static int sync_file_path(char *buf, size_t len, int make_dir)
         if (slash) { *slash = '\0'; mkdir(parent, 0755); }
         mkdir(dir, 0755);
     }
-    snprintf(buf, len, "%s/sync_ms", dir);
+    /* "trim" in the name: an older version saved an ABSOLUTE offset as
+     * sync_ms. A new name means that value is never misread as a trim. */
+    snprintf(buf, len, "%s/sync_trim_ms", dir);
     return 0;
 }
 
@@ -159,13 +163,37 @@ static void forget_saved_sync(void)
     if (sync_file_path(path, sizeof path, 0) == 0) unlink(path);
 }
 
+/* ---- Memory use, from the kernel ----
+ * /proc/self/status is a text file the kernel generates on the fly with
+ * stats about the process reading it. The "Rss" lines say how much of our
+ * memory is actually in RAM right now (in kB):
+ *   VmRSS     total resident set
+ *   RssAnon   private, "anonymous" memory: malloc, the music buffer, driver heaps
+ *   RssFile   pages of files mapped into memory: our code and shared libraries
+ *   RssShmem  shared memory (GPU drivers share buffers with the kernel/X)
+ * Note that VRAM on a discrete GPU isn't counted, since it's not in system RAM. */
+static void read_memory(long *rss, long *anon, long *file, long *shmem)
+{
+    *rss = *anon = *file = *shmem = 0;
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        sscanf(line, "VmRSS: %ld", rss);
+        sscanf(line, "RssAnon: %ld", anon);
+        sscanf(line, "RssFile: %ld", file);
+        sscanf(line, "RssShmem: %ld", shmem);
+    }
+    fclose(f);
+}
+
 /* [ / ] handler: adjust, remember, report. */
 static void nudge_sync(double delta)
 {
     g_sync += delta;
     g_sync_source = "saved";
     save_sync();
-    fprintf(stderr, "sync: %+.0f ms (saved)\n", g_sync * 1000.0);
+    fprintf(stderr, "sync trim: %+.0f ms (saved)\n", g_sync * 1000.0);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -308,9 +336,9 @@ static void on_key(GLFWwindow *win, int key, int scancode, int action, int mods)
     case GLFW_KEY_RIGHT_BRACKET: nudge_sync(+0.010); break;
     case GLFW_KEY_BACKSPACE:
         forget_saved_sync();
-        g_sync = audio_hidden_latency_guess();
-        g_sync_source = "auto";
-        fprintf(stderr, "sync: back to auto, %+.0f ms\n", g_sync * 1000.0);
+        g_sync = 0.0;
+        g_sync_source = "default";
+        fprintf(stderr, "sync trim: reset to 0\n");
         break;
     case GLFW_KEY_G:   g_switch_gpu = 1; glfwSetWindowShouldClose(win, GLFW_TRUE); break;
     }
@@ -385,12 +413,12 @@ static void usage(const char *argv0)
            "  --bpm N             tempo of --wav track for beat sync (default %.0f)\n"
            "  --offset S          seconds until the first beat in --wav track (default 0)\n"
            "  --nosound           no audio (visuals run on the wall clock)\n"
-           "  --sync-ms N         visual delay vs. the audio clock in ms\n"
-           "                      (default: last value set with [ ], else auto)\n"
+           "  --sync-ms N         sync trim in ms, on top of the automatic latency\n"
+           "                      compensation (default: last value set with [ ], else 0)\n"
            "  --hud               start with the HUD visible\n"
            "  --export FILE.wav   write the built-in track to a WAV file and exit\n"
            "keys: ESC/Q quit, F/F11 fullscreen, M mute, R reload shader.frag,\n"
-           "      H HUD, [ ] sync -/+ 10 ms (remembered), Backspace sync auto,\n"
+           "      H HUD, [ ] sync trim -/+ 10 ms (remembered), Backspace trim 0,\n"
            "      G relaunch on the other GPU\n",
            argv0, DEMO_BPM);
 }
@@ -490,11 +518,8 @@ int main(int argc, char **argv)
         if (rc != 0) fprintf(stderr, "audio unavailable, continuing silently\n");
     }
     /* Default visual delay: whatever latency the audio layer can't report. */
-    if (!g_sync_given) {
-        if (load_saved_sync(&g_sync)) g_sync_source = "saved";
-        else                          g_sync = audio_hidden_latency_guess();
-    }
-    fprintf(stderr, "sync: visuals delayed %.0f ms vs the audio clock (%s; [ / ] to adjust)\n",
+    if (!g_sync_given && load_saved_sync(&g_sync)) g_sync_source = "saved";
+    fprintf(stderr, "sync: auto (follows ALSA delay), trim %+.0f ms (%s; [ / ] to adjust)\n",
             g_sync * 1000.0, g_sync_source);
     double wall_start = glfwGetTime();
 
@@ -502,16 +527,21 @@ int main(int argc, char **argv)
     double prev_t = 0.0, rain_t = 0.0;
     double fps_t0 = glfwGetTime(), fps = 0.0, frame_ms = 0.0, last_frame = fps_t0;
     int    fps_frames = 0;
+    long   mem_rss = 0, mem_anon = 0, mem_file = 0, mem_shmem = 0;
+
+    /* The size of our own executable: /proc/self/exe is a link to it. */
+    struct stat exe_st;
+    long exe_bytes = stat("/proc/self/exe", &exe_st) == 0 ? (long)exe_st.st_size : 0;
 
     while (!glfwWindowShouldClose(win)) {
         if (g_reload_requested) { g_reload_requested = 0; reload_shader_from_disk(); }
 
         /* MASTER CLOCK: the music if we have it, the wall clock otherwise.
-         * With audio, subtract the sync offset: audio_time() is when sound left
-         * ALSA, plus g_sync of hidden latency is when it reaches your ears. */
+         * With audio: the estimated heard position, plus the (smoothed) ALSA
+         * delay, minus the user's trim. See the SYNC comment at the top. */
         double t = audio_time();
         if (t < 0.0) t = glfwGetTime() - wall_start;
-        else         t -= g_sync;
+        else         t += audio_smoothed_delay() - g_sync;
 
         /* BEAT SYNC. The whole approach in three lines:
          *   beats = seconds * BPM / 60              e.g. 128 BPM is 2.133 beats/s
@@ -566,6 +596,9 @@ int main(int argc, char **argv)
                 .audio_rate = audio_rate(),
                 .alsa_delay_ms = audio_reported_delay() * 1000.0,
                 .sync_ms = g_sync * 1000.0,
+                .auto_sync_ms = -audio_smoothed_delay() * 1000.0,
+                .rss_kb = mem_rss, .anon_kb = mem_anon, .file_kb = mem_file, .shmem_kb = mem_shmem,
+                .exe_bytes = exe_bytes,
                 .sync_source = g_sync_source,
                 .muted = audio_get_mute(),
                 .bpm = g_bpm, .beats = beats,
@@ -588,6 +621,7 @@ int main(int argc, char **argv)
         last_frame = now;
         if (now - fps_t0 >= 1.0) {
             fps = fps_frames / (now - fps_t0);
+            read_memory(&mem_rss, &mem_anon, &mem_file, &mem_shmem); /* once a second is plenty */
             char title[96];
             snprintf(title, sizeof title, "MATRIX RAIN // %.0f BPM // %d fps // beat %.0f%s",
                      g_bpm, (int)(fps_frames / (now - fps_t0) + 0.5), floor(beats),

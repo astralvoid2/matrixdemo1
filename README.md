@@ -38,9 +38,9 @@ inside it, so it can be copied anywhere.
 | `F` / `F11`  | toggle fullscreen                                          |
 | `M`          | mute / unmute (visual sync keeps running)                  |
 | `R`          | hot-reload `src/shader.frag` (run from the repo root)      |
-| `H`          | toggle the HUD: FPS, GPU, audio latency, sync, beat/phrase meters |
-| `[` / `]`    | nudge audio/visual sync by -/+ 10 ms (hold to sweep). **Remembered** between runs |
-| `Backspace`  | forget the remembered sync, back to the automatic value    |
+| `H`          | toggle the HUD: executable size, FPS, memory, GPU, audio latency, sync, beat/phrase meters |
+| `[` / `]`    | personal sync trim -/+ 10 ms on top of the automatic sync (hold to sweep). **Remembered** between runs |
+| `Backspace`  | reset the trim to 0                                        |
 | `G`          | relaunch on the other GPU (Intel/AMD and NVIDIA, see below) |
 
 ### Command-line options
@@ -49,7 +49,7 @@ inside it, so it can be copied anywhere.
 ./bin/demo --fullscreen          start fullscreen
 ./bin/demo --nosound             no audio (visuals use the wall clock)
 ./bin/demo --hud                 start with the HUD visible
-./bin/demo --sync-ms 150         delay the visuals 150 ms (overrides the remembered value)
+./bin/demo --sync-ms 30          trim: visuals 30 ms later (overrides the remembered trim)
 ./bin/demo --wav track.wav --bpm 140 [--offset 0.25]   play your own track
 ./bin/demo --export track.wav    save the built-in music as a WAV and exit
 make track                       same as above, writes ./track.wav
@@ -104,38 +104,61 @@ make track                       same as above, writes ./track.wav
   * `uRainTime`: a time that runs faster just after each kick. It is
     *integrated* (`rain += dt * speed`), not `time * speed`, so the rain
     never jumps.
-* "Seconds" here is **audio time**: frames written to ALSA minus frames
-  still queued (`snd_pcm_delay`), i.e. what has left the queue for the
-  speakers. The visuals cannot drift from the music, even after hours.
+* "Seconds" here is **audio time**, counted in samples played rather than
+  wall-clock time, so the visuals cannot drift from the music, even after
+  hours. Exactly which point in the audio chain to lock to is the next
+  section.
 
-### Latency the audio stack doesn't report (and the sync offset)
+### Sync: which point in the audio chain the visuals follow
 
-On a typical Ubuntu desktop, ALSA's `default` device is a plugin that forwards
-to PulseAudio, which is really PipeWire's PulseAudio emulation. That layer reports
-**0 µs** latency for every stream, so `snd_pcm_delay()` misses PipeWire's own
-queue, its 1024-sample quantum and the sound card buffer. Measured by
-recording the screen and the speaker monitor at the same time: the visuals
-were **~116 ms (a quarter beat) ahead** of the kicks.
+`snd_pcm_delay()` reports how much audio is queued between the demo and the
+output: about **70 ms** on the laptop speakers here, and about **240 ms** on
+Bluetooth headphones. In theory you subtract it ("you hear this sample
+*delay* seconds from now"). In practice, tested by ear on both outputs, the
+best sync was the opposite: visuals locked to the moment audio is handed to
+ALSA, i.e. *not* subtracting the delay. The visual side has latency of its
+own (compositor, display scan-out), and a fading flash is perceived around
+the middle of its glow rather than at its start.
 
-The fix: when the output is such a plugin, the visuals run **110 ms behind**
-the audio clock by default. Re-measured afterwards: **+9 ms** on the Intel
-GPU, **+34 ms** on the NVIDIA GPU (PRIME offload copies each frame over to the
-Intel display, which adds about a frame and a half).
+So the visual clock is:
 
-**Measured sync isn't always felt sync.** The beat flash jumps to full
-brightness on the kick, then fades over about a fifth of a beat. The eye weighs
-the whole glow, so the flash *feels* like it happens near the middle of the fade
-(about 94 ms after it starts), while a kick is heard at its sharp attack. On top
-of that, we're used to sound arriving after light. So many people prefer the
-visuals noticeably early: on the development laptop, a sync of **0 ms** felt
-best even though +110 ms measures as exact.
+```
+visual time = heard-time estimate + smoothed ALSA delay - your trim
+```
 
-So it's adjustable and **remembered**. Tune with `[` / `]` while watching the
-HUD's beat meter, and the value is saved to `~/.config/matrixrain/sync_ms`
-(or `$XDG_CONFIG_HOME/matrixrain/sync_ms`) and used on the next start. The HUD
-shows where the current value came from: `auto`, `saved` or `--sync-ms`.
-`Backspace` forgets it. Bluetooth headphones add 100–250 ms more, and some HDMI
-TVs more again.
+* **Automatic part:** follows the reported delay live (smoothed over about
+  half a second), so switching between speakers and Bluetooth just works,
+  even mid-run.
+* **Trim:** your personal preference on top, default 0. `[` / `]` adjust it in
+  10 ms steps (positive = visuals later). It's saved to
+  `~/.config/matrixrain/sync_trim_ms` (or under `$XDG_CONFIG_HOME`) and used
+  on the next start. `Backspace` resets it, and `--sync-ms N` overrides it.
+* The HUD shows the total and both parts, e.g. `SYNC -236 ms = auto -236 + trim +0 (default)`.
+
+*Lesson learned:* an earlier version measured sync by recording the screen and
+the speaker monitor with ffmpeg, and "corrected" by +110 ms. But ffmpeg's
+PulseAudio capture timestamps audio using the same latency reports, which
+PipeWire leaves at 0 µs, so the instrument shared the blind spot it was
+measuring. When the tool and your ears disagree, check the tool.
+
+### How big is it? (the HUD's MEM line)
+
+The HUD's title line shows the **executable size** (about 80 KB here,
+uncompressed and not size-optimized: everything, including the synth and
+shaders, is in there). The `MEM` line reads `/proc/self/status` once a
+second:
+
+| Field | Meaning | Typical |
+|-------|---------|---------|
+| total (`VmRSS`) | everything resident in RAM | ~80–85 MB |
+| `own` (`RssAnon`) | private memory: the 2.6 MB music loop, heaps, GL driver allocations | ~27 MB |
+| `libs` (`RssFile`) | shared-library pages: libGL, the Mesa/NVIDIA driver, libc… | ~55 MB |
+| `shm` (`RssShmem`) | shared memory buffers | ~0 MB |
+
+So a tiny program pulls in a large driver: almost all of the footprint is
+the OpenGL stack, not the demo. Real 4K intros have the same runtime cost,
+since "4K" limits the *file*, not RAM. VRAM on the NVIDIA GPU isn't in these
+numbers (it's not system RAM).
 
 ### Replacing the music with your own track (e.g. from a music-generation model)
 
@@ -222,7 +245,8 @@ falls back to the integrated GPU.
 | Beat hierarchy, virus spread/heal, RGB split   | `shader.frag`, `infection()`, `scene()`, `main()` |
 | Integrating speed instead of `time * speed`    | `main.c`, RAIN TIME comment                    |
 | Audio latency & the music clock                | `audio.c`, `audio_thread()` and `audio_time()` |
-| Hidden PipeWire latency, sync offset           | `audio.c` `audio_hidden_latency_guess()`, `main.c` MASTER CLOCK |
+| Audio/visual sync: auto delay + trim           | `audio.c` `audio_smoothed_delay()`, `main.c` SYNC + MASTER CLOCK |
+| Reading your own memory use from `/proc`       | `main.c`, `read_memory()`                      |
 | Saving settings the Linux way (XDG config dir) | `main.c`, `sync_file_path()`                   |
 | Bitmap-font HUD, blending a second pass        | `hud.c`                                        |
 | Switching GPU by re-exec'ing with PRIME variables | `main.c`, `relaunch_on_other_gpu()`         |

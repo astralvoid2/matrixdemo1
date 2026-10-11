@@ -53,6 +53,7 @@ static long long       g_clk_frames;
 static double          g_clk_stamp;  /* CLOCK_MONOTONIC seconds at measurement */
 static int             g_clk_valid;
 static long            g_last_delay;  /* frames ALSA said were queued (for the HUD) */
+static double          g_delay_ema;   /* the same, smoothed (frames); <0 = not yet set */
 
 static double now_sec(void)
 {
@@ -111,6 +112,12 @@ static void *audio_thread(void *arg)
 
         pthread_mutex_lock(&g_clk_mtx);
         g_last_delay = delay;
+        /* The raw delay jitters by a chunk or two from write to write. An
+         * exponential moving average (each new reading moves the average 2% of
+         * the way, about a half-second time constant) gives a steady value
+         * the visuals can follow without trembling. Switching outputs
+         * (speakers to Bluetooth) still settles within a second or so. */
+        g_delay_ema = g_delay_ema < 0 ? (double)delay : g_delay_ema + 0.02 * ((double)delay - g_delay_ema);
         g_clk_frames = heard;
         g_clk_stamp  = now_sec();
         g_clk_valid  = 1;
@@ -143,6 +150,7 @@ static int start_playback(int16_t *samples, long frames, unsigned rate)
         goto fail;
     }
 
+    g_delay_ema = -1.0;
     atomic_store(&g_running, 1);
     if (pthread_create(&g_thread, NULL, audio_thread, NULL) != 0) {
         atomic_store(&g_running, 0);
@@ -337,23 +345,25 @@ double audio_reported_delay(void)
 }
 
 /*
- * HIDDEN LATENCY. snd_pcm_delay() is only as honest as the layer below us.
- * Talking straight to hardware (type HW), it's exact. On a desktop, "default"
- * is usually an I/O PLUGIN (type IOPLUG) that forwards to PulseAudio, which on
- * Ubuntu 22.04+ is really PipeWire's PulseAudio emulation. That emulation
- * reports 0 us of latency for every stream, so the plugin's delay only
- * counts its OWN buffer and misses PipeWire's queue, the graph quantum
- * (1024 samples = 21 ms) and the sound card's buffer.
- *
- * Measured on a Meteor Lake laptop by recording the screen and the speaker
- * monitor together: visuals led the kicks by ~116 ms. So for plugin outputs
- * we assume this much extra, unreported latency by default. The user can fine-tune
- * it live with [ and ] (Bluetooth headphones add another 100-200 ms).
+ * WHICH CLOCK SHOULD THE VISUALS USE?
+ * In theory, the moment you HEAR sample n is (n - delay), with delay from
+ * snd_pcm_delay(), and audio_time() reports exactly that. In practice the
+ * visuals have latency too: compositor, display scan-out, and the way the eye
+ * reads a fading flash as happening around the middle of its glow.
+ * Tested by ear on a laptop, on built-in speakers (~70 ms reported) and on
+ * Bluetooth headphones (~240 ms reported), the best sync in BOTH cases
+ * was visuals running exactly `delay` AHEAD of audio_time(), i.e. aligned to
+ * the moment audio is handed to ALSA. main.c therefore adds this smoothed
+ * delay back on, which means it follows output changes automatically, and
+ * the user's [ / ] trim sits on top.
  */
-double audio_hidden_latency_guess(void)
+double audio_smoothed_delay(void)
 {
     if (!g_pcm) return 0.0;
-    return snd_pcm_type(g_pcm) == SND_PCM_TYPE_IOPLUG ? 0.110 : 0.0;
+    pthread_mutex_lock(&g_clk_mtx);
+    double d = g_delay_ema < 0 ? 0.0 : g_delay_ema / g_rate;
+    pthread_mutex_unlock(&g_clk_mtx);
+    return d;
 }
 
 const char *audio_backend_name(void)

@@ -28,9 +28,9 @@ double audio_time(void);
 /* Queue length ALSA last reported, in seconds (for display). <0 if no audio. */
 double audio_reported_delay(void);
 
-/* Best guess of output latency that ALSA can't see (seconds). The visuals
- * should run this far BEHIND audio_time(). See audio.c for the story. */
-double audio_hidden_latency_guess(void);
+/* The ALSA delay, smoothed (seconds; 0 if no audio). The visuals run this
+ * far AHEAD of audio_time(). See audio.c for why. */
+double audio_smoothed_delay(void);
 
 const char *audio_backend_name(void);   /* short description for the HUD */
 unsigned    audio_rate(void);           /* sample rate in Hz, 0 if no audio */

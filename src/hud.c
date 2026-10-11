@@ -28,7 +28,7 @@
 
 /* ---- Canvas geometry (in texels; scaled up by an integer on screen) ---- */
 #define COLS     64          /* characters per line           */
-#define ROWS     10          /* lines                         */
+#define ROWS     11          /* lines                         */
 #define CW       6           /* char cell: 5 px glyph + 1 gap */
 #define CH       9           /* line height: 7 px glyph + 2   */
 #define PAD      4           /* border inside the panel       */
@@ -177,11 +177,24 @@ void hud_draw(const HudInfo *in, int fb_w, int fb_h)
 
     int r = 0, c;
     c = text(0, r, HI, "MATRIX RAIN");
-    text(c, r++, DIM, " // HUD");
+    c = text(c, r, DIM, " // HUD          executable ");
+    text(c, r++, HI, "%.1f KB", in->exe_bytes / 1024.0);
 
     c = text(0, r, DIM, "FPS   ");
     c = text(c, r, HI, "%5.1f", in->fps);
     text(c, r++, MID, "  %5.2f ms/frame", in->frame_ms);
+
+    /* Memory, in MB. RSS = what's actually in RAM. "own" is this process's
+     * private allocations, "libs" the shared-library pages mapped from disk,
+     * "shm" shared memory (GPU drivers keep buffers there). */
+    c = text(0, r, DIM, "MEM   ");
+    c = text(c, r, HI, "%5.1f MB", in->rss_kb / 1024.0);
+    c = text(c, r, DIM, "  own ");
+    c = text(c, r, MID, "%.1f", in->anon_kb / 1024.0);
+    c = text(c, r, DIM, "  libs ");
+    c = text(c, r, MID, "%.1f", in->file_kb / 1024.0);
+    c = text(c, r, DIM, "  shm ");
+    text(c, r++, MID, "%.1f", in->shmem_kb / 1024.0);
 
     c = text(0, r, DIM, "GPU   ");
     text(c, r++, HI, "%.58s", in->gl_renderer ? in->gl_renderer : "?");
@@ -200,10 +213,14 @@ void hud_draw(const HudInfo *in, int fb_w, int fb_h)
         r++;
     }
 
+    /* Total visual offset = automatic part (minus the ALSA delay) + trim. */
     c = text(0, r, DIM, "SYNC  ");
-    c = text(c, r, HI, "%+4.0f ms", in->sync_ms);
-    c = text(c, r, DIM, "  visual delay  ");
-    text(c, r++, MID, "%.12s", in->sync_source ? in->sync_source : "");
+    c = text(c, r, HI, "%+4.0f ms", in->auto_sync_ms + in->sync_ms);
+    c = text(c, r, DIM, " = auto ");
+    c = text(c, r, MID, "%+.0f", in->auto_sync_ms);
+    c = text(c, r, DIM, " + trim ");
+    c = text(c, r, HI, "%+.0f", in->sync_ms);
+    text(c, r++, DIM, " (%.9s)", in->sync_source ? in->sync_source : "");
 
     /* Musical position: bar.beat, a 4-box beat meter and a 16-step phrase bar. */
     double b = in->beats < 0 ? 0 : in->beats;
@@ -227,7 +244,7 @@ void hud_draw(const HudInfo *in, int fb_w, int fb_h)
     r++;
 
     /* Footer: the keys. */
-    text(0, r, DIM, "keys: H hud  M mute  [ ] sync  BkSp auto  F full%s",
+    text(0, r, DIM, "keys: H hud  M mute  [ ] trim  BkSp reset  F full%s",
          in->other_gpu ? "  G GPU" : "");
 
     /* Upload and draw. Scale 2x at 720p, 3x at 1080p, and so on. */

@@ -10,6 +10,10 @@
 
 typedef struct {
     double      fps, frame_ms;
+    double      gpu_ms;         /* GPU time for the rain, from timer queries */
+    double      gpu_peak_ms;    /* worst single frame in the last second     */
+    int         vsync, fb_w, fb_h;
+    int         rt_w, rt_h, scale_pc; /* scene render size and render scale (%) */
     const char *gl_renderer, *gl_version;
     const char *audio_source;   /* "procedural" or the WAV file name, or NULL */
     const char *audio_backend;

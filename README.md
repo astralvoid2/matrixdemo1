@@ -37,8 +37,10 @@ inside it, so it can be copied anywhere.
 | `ESC` / `Q`  | quit                                                       |
 | `F` / `F11`  | toggle fullscreen                                          |
 | `M`          | mute / unmute (visual sync keeps running)                  |
-| `R`          | hot-reload `src/shader.frag` (run from the repo root)      |
-| `H`          | toggle the HUD: executable size, FPS, memory, GPU, audio latency, sync, beat/phrase meters |
+| `R`          | hot-reload `src/shader.frag` and `src/post.frag` (run from the repo root) |
+| `H`          | toggle the HUD: executable size, FPS, GPU time, memory, GPU, audio latency, sync, beat/phrase meters |
+| `V`          | toggle vsync (off = unlocked frame rate, for benchmarking) |
+| `S`          | render scale: cycle 100% / 75% / 50% (draw the scene smaller, stretch it to the screen) |
 | `[` / `]`    | personal sync trim -/+ 10 ms on top of the automatic sync (hold to sweep). **Remembered** between runs |
 | `Backspace`  | reset the trim to 0                                        |
 | `G`          | relaunch on the other GPU (Intel/AMD and NVIDIA, see below) |
@@ -49,6 +51,8 @@ inside it, so it can be copied anywhere.
 ./bin/demo --fullscreen          start fullscreen
 ./bin/demo --nosound             no audio (visuals use the wall clock)
 ./bin/demo --hud                 start with the HUD visible
+./bin/demo --novsync             unlocked frame rate (benchmark)
+./bin/demo --scale 50            render the scene at 50% resolution (faster on 4K screens)
 ./bin/demo --sync-ms 30          trim: visuals 30 ms later (overrides the remembered trim)
 ./bin/demo --wav track.wav --bpm 140 [--offset 0.25]   play your own track
 ./bin/demo --export track.wav    save the built-in music as a WAV and exit
@@ -65,7 +69,8 @@ make track                       same as above, writes ./track.wav
 ├── docs/screenshot.png   README image
 ├── src/
 │   ├── main.c          window, GL context, shaders, main loop, beat uniforms
-│   ├── shader.frag     the Matrix rain (embedded into the binary at build time)
+│   ├── shader.frag     pass 1: the Matrix rain scene (embedded at build time)
+│   ├── post.frag       pass 2: RGB split, vignette, scanlines, grain, tone mapping
 │   ├── synth.c/.h      procedural music (BPM is defined in synth.h)
 │   ├── hud.c/.h        text overlay (H): bitmap font, CPU canvas, blend pass
 │   └── audio.c/.h      ALSA playback thread, music clock, WAV load/save
@@ -76,7 +81,8 @@ make track                       same as above, writes ./track.wav
 | File               | What's inside                                                         |
 |--------------------|-----------------------------------------------------------------------|
 | `src/main.c`       | GLFW window, GL 3.3 core context, shader build/reload, the full-screen triangle, music clock and beat uniforms, main loop, fullscreen toggle |
-| `src/shader.frag`  | The rain: integer hashes, stateless drop/reset logic, procedural 5x7 glyphs, glow, beat reaction, glitch, CRT-ish post-processing |
+| `src/shader.frag`  | Pass 1, the scene: integer hashes, stateless drop/reset logic, procedural 5x7 glyphs, glow, beat hits, virus, glitch. Renders into an HDR texture |
+| `src/post.frag`    | Pass 2, screen-space effects: RGB split, vignette, scanlines, film grain, tone mapping |
 | `src/synth.c/.h`   | Procedural music: kick, clap, hats, rolling bass, pad, arp + delay, sidechain pumping |
 | `src/audio.c/.h`   | ALSA playback thread, latency-corrected music clock, WAV loader/writer |
 | `src/hud.c/.h`     | HUD overlay: 5x7 bitmap font drawn into a texture, composited with a second tiny shader |
@@ -140,6 +146,59 @@ the speaker monitor with ffmpeg, and "corrected" by +110 ms. But ffmpeg's
 PulseAudio capture timestamps audio using the same latency reports, which
 PipeWire leaves at 0 µs, so the instrument shared the blind spot it was
 measuring. When the tool and your ears disagree, check the tool.
+
+### Frame rate, vsync and GPU time (the HUD's FPS line)
+
+By default the demo waits for the display's refresh before showing each frame
+(**vsync**), so FPS sits at your refresh rate, e.g. 60. That's deliberate:
+a 60 Hz panel can't show more frames, rendering them anyway causes
+**tearing** (a frame replaced mid-scan) and burns power, heat and fan noise
+for nothing, and every frame staying on screen for exactly one refresh looks
+smoothest.
+
+The cost: a locked counter can't show **headroom**. So the HUD also shows
+**GPU time**, measured by the GPU itself with OpenGL timer queries
+(`GL_TIME_ELAPSED`, read back a few frames later so it never stalls): the
+smoothed average plus the **peak** (worst frame in the last second). At 60 Hz
+the budget is 16.7 ms. `V` (or `--novsync`) unlocks the frame rate to
+benchmark.
+
+### Two passes: why the scene goes through a texture
+
+The first version drew everything in one shader. The **RGB split** (red and
+blue pulled sideways on bar punches and virus hits) needs the scene at three
+positions, and in one pass the only way to get that is to **render the whole
+scene three times**. At 3840×2400 on the Intel Arc, that pushed the worst
+frames to 17–19 ms, over the 16.7 ms budget, so it dropped frames once per bar.
+
+Now the work is split:
+
+1. **Scene pass** (`shader.frag`): draws the rain **once** into an off-screen
+   **framebuffer object** (FBO) whose colour is a `GL_RGBA16F` texture. 16-bit
+   float, because glow values above 1.0 must survive until tone mapping.
+2. **Post pass** (`post.frag`): draws the window by reading that texture. The
+   RGB split is now three texture reads, not three scenes. Vignette,
+   scanlines, grain and tone mapping happen here too, at full display
+   resolution.
+
+The texture also enables a **render scale** (`S`, `--scale`): the scene can be
+drawn at 75% or 50% size and stretched by bilinear filtering in the post pass.
+Because scanlines and grain are still added per display pixel, the stretch is
+hard to notice.
+
+Measured fullscreen at 3840×2400:
+
+| | GPU avg | GPU peak | FPS (vsync) | FPS (unlocked) |
+|---|---|---|---|---|
+| Intel Arc, one-pass (before) | 6–14 ms | 17–19 ms | **48–60** | 56–73 |
+| Intel Arc, two-pass, 100% | 8.3 ms | **10.9 ms** | **60** | 66–68 |
+| Intel Arc, two-pass, 75% | 5.7 ms | 8.3 ms | 60 | 80–82 |
+| Intel Arc, two-pass, 50% | 4.0 ms | 6.4 ms | 60 | 95–96 |
+| NVIDIA RTX 2000 Ada, two-pass, 100% | 2.7 ms | 2.7 ms | 60 | 158–163 |
+
+Unlocked FPS sits below what GPU time alone would allow: presenting a
+3840×2400 frame (the compositor and display copy) costs time outside the
+demo's own draw calls. That's why windowed is much faster.
 
 ### How big is it? (the HUD's MEM line)
 
@@ -282,6 +341,8 @@ falls back to the integrated GPU.
 | Audio latency & the music clock                | `audio.c`, `audio_thread()` and `audio_time()` |
 | Audio/visual sync: auto delay + trim           | `audio.c` `audio_smoothed_delay()`, `main.c` SYNC + MASTER CLOCK |
 | Reading your own memory use from `/proc`       | `main.c`, `read_memory()`                      |
+| Vsync, and timing the GPU with timer queries   | `main.c`, VSYNC and TIMER QUERIES comments     |
+| Render-to-texture (FBO), two passes, render scale | `main.c` RENDER TARGET, `post.frag` header  |
 | Saving settings the Linux way (XDG config dir) | `main.c`, `sync_file_path()`                   |
 | Bitmap-font HUD, blending a second pass        | `hud.c`                                        |
 | Switching GPU by re-exec'ing with PRIME variables | `main.c`, `relaunch_on_other_gpu()`         |

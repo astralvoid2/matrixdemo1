@@ -18,7 +18,7 @@ BIN_DIR   := bin
 TARGET    := $(BIN_DIR)/demo
 
 SRCS    := $(wildcard $(SRC_DIR)/*.c)
-OBJS    := $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o) $(BUILD_DIR)/shader_frag.o
+OBJS    := $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o) $(BUILD_DIR)/shader_frag.o $(BUILD_DIR)/post_frag.o
 HEADERS := $(wildcard $(SRC_DIR)/*.h)
 
 # pkg-config tells us the right compiler/linker flags for GLFW on this system,
@@ -50,8 +50,9 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(HEADERS) | $(BUILD_DIR)
 # symbols named after the PATH it was given: _binary_shader_frag_start / _end.
 # So we cd into src/ first. Running it on "src/shader.frag" would instead name
 # them _binary_src_shader_frag_start, and main.c wouldn't find them.
-$(BUILD_DIR)/shader_frag.o: $(SRC_DIR)/shader.frag | $(BUILD_DIR)
-	cd $(SRC_DIR) && $(LD) -r -b binary -o $(abspath $@) shader.frag
+# The same pattern rule handles shader.frag and post.frag ($* = the stem).
+$(BUILD_DIR)/%_frag.o: $(SRC_DIR)/%.frag | $(BUILD_DIR)
+	cd $(SRC_DIR) && $(LD) -r -b binary -o $(abspath $@) $*.frag
 
 # "Order-only" prerequisites (after the |): the directory must exist, but its
 # timestamp changing doesn't force a rebuild.

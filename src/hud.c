@@ -28,7 +28,7 @@
 
 /* ---- Canvas geometry (in texels; scaled up by an integer on screen) ---- */
 #define COLS     64          /* characters per line           */
-#define ROWS     11          /* lines                         */
+#define ROWS     12          /* lines                         */
 #define CW       6           /* char cell: 5 px glyph + 1 gap */
 #define CH       9           /* line height: 7 px glyph + 2   */
 #define PAD      4           /* border inside the panel       */
@@ -180,9 +180,25 @@ void hud_draw(const HudInfo *in, int fb_w, int fb_h)
     c = text(c, r, DIM, " // HUD          executable ");
     text(c, r++, HI, "%.1f KB", in->exe_bytes / 1024.0);
 
+    /* FPS is capped by vsync. GPU ms is the real cost: at 60 Hz there are
+     * 16.7 ms per frame, so "GPU 4 ms" means about 4x headroom. */
     c = text(0, r, DIM, "FPS   ");
     c = text(c, r, HI, "%5.1f", in->fps);
-    text(c, r++, MID, "  %5.2f ms/frame", in->frame_ms);
+    c = text(c, r, MID, " %5.2f ms", in->frame_ms);
+    c = text(c, r, DIM, "  GPU ");
+    c = text(c, r, HI, "%.1f", in->gpu_ms);
+    c = text(c, r, DIM, " peak ");
+    c = text(c, r, HI, "%.1f ms", in->gpu_peak_ms);
+    text(c, r++, in->vsync ? DIM : HI, "  vsync %s", in->vsync ? "on" : "OFF");
+
+    /* Render scale: the scene is drawn at rt_w x rt_h, then stretched to the
+     * display. Fewer pixels = less GPU time; S cycles 100/75/50%. */
+    c = text(0, r, DIM, "RES   ");
+    c = text(c, r, HI, "%dx%d", in->rt_w, in->rt_h);
+    c = text(c, r, in->scale_pc == 100 ? DIM : HI, " (%d%%)", in->scale_pc);
+    c = text(c, r, DIM, " of ");
+    c = text(c, r, MID, "%dx%d", in->fb_w, in->fb_h);
+    text(c, r++, DIM, "   S scale");
 
     /* Memory, in MB. RSS = what's actually in RAM. "own" is this process's
      * private allocations, "libs" the shared-library pages mapped from disk,
@@ -244,7 +260,7 @@ void hud_draw(const HudInfo *in, int fb_w, int fb_h)
     r++;
 
     /* Footer: the keys. */
-    text(0, r, DIM, "keys: H hud  M mute  [ ] trim  BkSp reset  F full%s",
+    text(0, r, DIM, "keys: H hud  V vsync  M mute  [ ] trim  BkSp 0  F full%s",
          in->other_gpu ? "  G GPU" : "");
 
     /* Upload and draw. Scale 2x at 720p, 3x at 1080p, and so on. */

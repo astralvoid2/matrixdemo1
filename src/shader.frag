@@ -24,8 +24,15 @@
  * big, bright "near" layer. Different sizes and speeds fake depth (parallax).
  *
  * COORDINATES
- *   gl_FragCoord.xy = pixel centre in window pixels, origin BOTTOM-left,
- *   y goes up. Rain falls downward, so we count rows from the top.
+ *   gl_FragCoord.xy = pixel centre in pixels of the render target, origin
+ *   BOTTOM-left, y goes up. Rain falls downward, so we count rows from the top.
+ *
+ * TWO PASSES
+ *   This shader draws the SCENE into an off-screen texture (possibly at a
+ *   reduced "render scale"), in HDR: colours may exceed 1.0. post.frag then
+ *   reads that texture and does the screen-space effects (RGB split,
+ *   vignette, scanlines, grain, tone mapping) at full display resolution.
+ *   See main.c, RENDER TARGET, for why.
  *
  * Edit this file and press R in the running demo to hot-reload it.
  */
@@ -274,6 +281,7 @@ const vec3  VIRUS_COLOR = vec3(1.00, 0.10, 0.22);   // infected code
 const vec3  VIRUS_HOT   = vec3(1.00, 0.75, 0.80);   // infection front / corrupted glyphs
 
 // Exponential decays since the last bar / phrase downbeat. 1 on the hit, falls to ~0.
+// post.frag has identical copies (for the RGB split). Change both together.
 float barPunch()  { return uBeatCount > 0.0 ? exp(-mod(uBeatCount, 4.0) * 3.0) : 0.0; }
 float phraseHit() { return uBeatCount > 0.0 ? exp(-mod(uBeatCount, PHRASE) * 2.5) : 0.0; }
 
@@ -423,43 +431,6 @@ vec3 scene(vec2 frag)
 /* ======================================================================== */
 void main()
 {
-    vec2 frag = gl_FragCoord.xy;
-
-    /* RGB SPLIT (chromatic aberration): render the scene three times with
-     * small horizontal offsets and take R from one, G from another, B from
-     * the third. Red and blue fringes peel apart, like a broken video cable.
-     * It costs 3x the work, so only do it while the punch is visible. Every
-     * pixel takes the same branch (it depends only on uniforms), so there's
-     * no divergence penalty on the GPU. */
-    float split = (6.0 * barPunch() + 22.0 * phraseHit()) * (uResolution.y / 720.0);
-    vec3 col;
-    if (split > 0.75) {
-        col.r = scene(frag + vec2(split, 0.0)).r;
-        col.g = scene(frag).g;
-        col.b = scene(frag - vec2(split, 0.0)).b;
-    } else {
-        col = scene(frag);
-    }
-
-    /* ---- Post-processing ---- */
-    vec2 uv = frag / uResolution;
-
-    // Vignette: darken towards the corners to frame the image.
-    vec2 v = uv - 0.5;
-    col *= 1.0 - dot(v, v) * 1.1;
-
-    // Scanlines: sin(pi*y) at pixel centres (y = n + 0.5) alternates +1/-1,
-    // so every other line is 12% darker. A cheap CRT feel.
-    col *= 0.94 + 0.06 * sin(gl_FragCoord.y * 3.14159265);
-
-    // Film grain: tiny per-pixel, per-frame noise. Also hides gradient banding.
-    uint px = uint(gl_FragCoord.x) + uint(gl_FragCoord.y) * 4096u;
-    col += (toF(hashU(px ^ hashU(uint(uTime * 60.0)))) - 0.5) * 0.025;
-
-    /* Tone mapping: 1 - exp(-x) maps [0, infinity) smoothly into [0, 1), so
-     * bright heads plus glow roll off softly to white-green instead of
-     * clipping to a flat blob. */
-    col = 1.0 - exp(-col * 1.25);
-
-    fragColor = vec4(col, 1.0);
+    // Just the scene, in HDR. All screen-space effects happen in post.frag.
+    fragColor = vec4(scene(gl_FragCoord.xy), 1.0);
 }

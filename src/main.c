@@ -65,6 +65,8 @@
  * ------------------------------------------------------------------------- */
 extern const char _binary_shader_frag_start[];
 extern const char _binary_shader_frag_end[];
+extern const char _binary_post_frag_start[];   /* post.frag, embedded the same way */
+extern const char _binary_post_frag_end[];
 
 /* Vertex shader: generates the 3 corners of the full-screen triangle.
  *   gl_VertexID = 0 -> (0,0) -> clip (-1,-1)   bottom-left
@@ -81,8 +83,25 @@ static const char *VERTEX_SRC =
 /* ------------------------------------------------------------------------- */
 /* Global state (a demo is one big singleton; globals keep it readable)      */
 /* ------------------------------------------------------------------------- */
+/* Two shader programs: the SCENE (shader.frag) draws the rain into an
+ * off-screen texture, and POST (post.frag) puts it on screen with the
+ * screen-space effects. See RENDER TARGET below. */
 static GLuint g_program;
 static GLint  u_resolution, u_time, u_rain_time, u_beat, u_beat_count;
+static GLuint g_post;
+static GLint  p_scene, p_resolution, p_time, p_beat_count;
+
+/* RENDER TARGET: a framebuffer object (FBO) is an off-screen surface we
+ * can draw into instead of the window. Its colour goes into g_scene_tex.
+ * We use GL_RGBA16F (16-bit float per channel) so glow values above 1.0
+ * survive until post.frag tone-maps them. 8-bit would clip them first.
+ * Its size is the window size times the RENDER SCALE (S key): drawing the
+ * expensive scene at 50% means a quarter of the pixels, and post.frag
+ * stretches it back up. */
+static GLuint g_fbo, g_scene_tex;
+static int    g_rt_w, g_rt_h;
+static const double SCALES[] = {1.0, 0.75, 0.5};
+static int    g_scale_idx;
 
 static double g_bpm    = DEMO_BPM;  /* overridable with --bpm for custom tracks */
 static double g_offset = 0.0;       /* seconds before the first beat in a WAV  */
@@ -92,6 +111,7 @@ static int g_win_x, g_win_y, g_win_w = 1280, g_win_h = 720; /* saved windowed ge
 static int g_reload_requested;
 static int g_hud_on;              /* H toggles the overlay                        */
 static int g_switch_gpu;          /* G: quit and relaunch on the other GPU         */
+static int g_vsync = 1;           /* V toggles. See the VSYNC comment in main()    */
 
 /* SYNC. The visual clock is
  *     audio_time() + audio_smoothed_delay() - g_sync
@@ -252,10 +272,20 @@ static GLuint build_program(const char *frag_src, GLint frag_len, const char *fr
     return prog;
 }
 
-/* Make `prog` current and look up its uniforms by name.
+/* Install a scene/post program and look up its uniforms by name.
  * A uniform the compiler optimised away (unused in the shader) returns -1,
  * and glUniform* calls with location -1 are silently ignored, so it's safe
  * to experiment with shaders that don't use every uniform. */
+static void set_post_program(GLuint prog)
+{
+    if (g_post) glDeleteProgram(g_post);
+    g_post       = prog;
+    p_scene      = glGetUniformLocation(prog, "uScene");
+    p_resolution = glGetUniformLocation(prog, "uResolution");
+    p_time       = glGetUniformLocation(prog, "uTime");
+    p_beat_count = glGetUniformLocation(prog, "uBeatCount");
+}
+
 static void use_program(GLuint prog)
 {
     if (g_program) glDeleteProgram(g_program);
@@ -268,28 +298,61 @@ static void use_program(GLuint prog)
     u_beat_count = glGetUniformLocation(prog, "uBeatCount");
 }
 
-/* Hot reload: read the shader from disk and swap it in if it compiles. If it
- * doesn't, keep the old one running and print the errors, so you can iterate
- * on the visuals without restarting the music. We look in src/ (running
- * bin/demo from the repo root) and then the current directory (running from
- * inside src/, or a copy of the shader placed next to you). */
-static void reload_shader_from_disk(void)
+/* Hot reload: read a shader from disk and build it. If it doesn't compile,
+ * return 0 and the caller keeps the old one running, so you can iterate on
+ * the visuals without restarting the music. We look in src/ (running bin/demo
+ * from the repo root) and then the current directory. */
+static GLuint build_from_disk(const char *name)
 {
-    const char *path = "src/shader.frag";
+    char path[256];
+    snprintf(path, sizeof path, "src/%s", name);
     FILE *f = fopen(path, "rb");
-    if (!f) f = fopen(path = "shader.frag", "rb");
-    if (!f) { fprintf(stderr, "reload: src/shader.frag not found (run from the repo root)\n"); return; }
+    if (!f) f = fopen(strcpy(path, name), "rb");
+    if (!f) { fprintf(stderr, "reload: src/%s not found (run from the repo root)\n", name); return 0; }
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
     char *src = malloc((size_t)n);
-    if (src && fread(src, 1, (size_t)n, f) == (size_t)n) {
-        GLuint prog = build_program(src, (GLint)n, path);
-        if (prog) { use_program(prog); fprintf(stderr, "reload: %s OK\n", path); }
-        else      fprintf(stderr, "reload: keeping previous shader\n");
-    }
+    GLuint prog = 0;
+    if (src && fread(src, 1, (size_t)n, f) == (size_t)n) prog = build_program(src, (GLint)n, path);
     free(src);
     fclose(f);
+    fprintf(stderr, "reload: %s %s\n", path, prog ? "OK" : "FAILED, keeping previous");
+    return prog;
+}
+
+static void reload_shaders_from_disk(void)
+{
+    GLuint scene = build_from_disk("shader.frag");
+    if (scene) use_program(scene);
+    GLuint post = build_from_disk("post.frag");
+    if (post) set_post_program(post);
+}
+
+/* (Re)create the off-screen render target if the wanted size changed.
+ * Called every frame, but only does work after a resize or scale change. */
+static void ensure_render_target(int w, int h)
+{
+    if (w == g_rt_w && h == g_rt_h && g_fbo) return;
+    g_rt_w = w;
+    g_rt_h = h;
+    if (!g_scene_tex) glGenTextures(1, &g_scene_tex);
+    glBindTexture(GL_TEXTURE_2D, g_scene_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT, NULL);
+    /* LINEAR = bilinear filtering when post.frag stretches a scaled-down
+     * scene. CLAMP_TO_EDGE: the RGB split reads slightly outside [0,1] at
+     * the screen edges, so repeat the edge pixels instead of wrapping around. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    if (!g_fbo) glGenFramebuffers(1, &g_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_scene_tex, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        fprintf(stderr, "render target %dx%d incomplete\n", w, h);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);   /* 0 = the window again */
 }
 
 /* ------------------------------------------------------------------------- */
@@ -310,7 +373,7 @@ static void toggle_fullscreen(GLFWwindow *win)
         glfwSetWindowMonitor(win, NULL, g_win_x, g_win_y, g_win_w, g_win_h, GLFW_DONT_CARE);
     }
     g_fullscreen = !g_fullscreen;
-    glfwSwapInterval(1); /* some drivers reset vsync on a mode change */
+    glfwSwapInterval(g_vsync); /* some drivers reset vsync on a mode change */
 }
 
 /* GLFW calls this from glfwPollEvents() for every key press/release/repeat.
@@ -330,6 +393,7 @@ static void on_key(GLFWwindow *win, int key, int scancode, int action, int mods)
     case GLFW_KEY_F11: toggle_fullscreen(win); break;
     case GLFW_KEY_M:   audio_set_mute(!audio_get_mute()); break;
     case GLFW_KEY_R:   g_reload_requested = 1; break; /* do GL work in the main loop */
+    case GLFW_KEY_S:   g_scale_idx = (g_scale_idx + 1) % 3; break;
     case GLFW_KEY_H:   g_hud_on = !g_hud_on; break;
     /* [ and ] by physical key position (US layout names). Visuals later / earlier. */
     case GLFW_KEY_LEFT_BRACKET:  nudge_sync(-0.010); break;
@@ -341,6 +405,7 @@ static void on_key(GLFWwindow *win, int key, int scancode, int action, int mods)
         fprintf(stderr, "sync trim: reset to 0\n");
         break;
     case GLFW_KEY_G:   g_switch_gpu = 1; glfwSetWindowShouldClose(win, GLFW_TRUE); break;
+    case GLFW_KEY_V:   g_vsync = !g_vsync; glfwSwapInterval(g_vsync); break;
     }
 }
 
@@ -384,11 +449,19 @@ static void relaunch_on_other_gpu(char **argv, int on_nvidia)
     int n = 0;
     args[n++] = argv[0];
     for (int i = 1; argv[i] && n < 56; i++) {
-        if (!strcmp(argv[i], "--hud") || !strcmp(argv[i], "--fullscreen")) continue;
-        if (!strcmp(argv[i], "--sync-ms")) { if (argv[i + 1]) i++; continue; }
+        if (!strcmp(argv[i], "--hud") || !strcmp(argv[i], "--fullscreen") ||
+            !strcmp(argv[i], "--novsync")) continue;
+        if (!strcmp(argv[i], "--sync-ms") || !strcmp(argv[i], "--scale")) { if (argv[i + 1]) i++; continue; }
         args[n++] = argv[i];
     }
     if (g_hud_on)     args[n++] = "--hud";
+    if (!g_vsync)     args[n++] = "--novsync";
+    static char scale_buf[16];
+    if (g_scale_idx) {
+        snprintf(scale_buf, sizeof scale_buf, "%.0f", SCALES[g_scale_idx] * 100.0);
+        args[n++] = "--scale";
+        args[n++] = scale_buf;
+    }
     if (g_fullscreen) args[n++] = "--fullscreen";
     /* A saved or auto offset re-derives itself in the new process. Only an
      * explicit --sync-ms (possibly nudged since) needs passing on. */
@@ -416,10 +489,12 @@ static void usage(const char *argv0)
            "  --sync-ms N         sync trim in ms, on top of the automatic latency\n"
            "                      compensation (default: last value set with [ ], else 0)\n"
            "  --hud               start with the HUD visible\n"
+           "  --novsync           don't wait for the display refresh (benchmark)\n"
+           "  --scale 100|75|50   render the scene at this %% of the display resolution\n"
            "  --export FILE.wav   write the built-in track to a WAV file and exit\n"
-           "keys: ESC/Q quit, F/F11 fullscreen, M mute, R reload shader.frag,\n"
-           "      H HUD, [ ] sync trim -/+ 10 ms (remembered), Backspace trim 0,\n"
-           "      G relaunch on the other GPU\n",
+           "keys: ESC/Q quit, F/F11 fullscreen, M mute, R reload shaders,\n"
+           "      H HUD, V vsync, S render scale, [ ] sync trim -/+ 10 ms (remembered),\n"
+           "      Backspace trim 0, G relaunch on the other GPU\n",
            argv0, DEMO_BPM);
 }
 
@@ -434,6 +509,9 @@ int main(int argc, char **argv)
         if      (!strcmp(a, "--fullscreen"))       start_fullscreen = 1;
         else if (!strcmp(a, "--nosound"))          nosound = 1;
         else if (!strcmp(a, "--hud"))              g_hud_on = 1;
+        else if (!strcmp(a, "--novsync"))          g_vsync = 0;
+        else if (!strcmp(a, "--scale") && more)    { int pc = atoi(argv[++i]);
+                                                     g_scale_idx = pc <= 50 ? 2 : pc <= 75 ? 1 : 0; }
         else if (!strcmp(a, "--sync-ms") && more)  { g_sync = atof(argv[++i]) / 1000.0; g_sync_given = 1;
                                                      g_sync_source = "--sync-ms"; }
         else if (!strcmp(a, "--wav")    && more)   wav = argv[++i];
@@ -478,9 +556,14 @@ int main(int argc, char **argv)
     glfwSetKeyCallback(win, on_key);
 
     /* VSYNC: wait for the monitor's vertical blank before swapping. That caps
-     * us at the refresh rate (60/144/... Hz), avoids tearing, and stops
-     * the GPU from rendering thousands of frames per second for no reason. */
-    glfwSwapInterval(1);
+     * us at the refresh rate (60/144/... Hz), avoids tearing (a new frame
+     * replacing the old one mid-scan), and stops the GPU rendering frames
+     * the display can never show, which saves power, heat and fan noise.
+     * The catch: FPS then can't show how much headroom you have, so the HUD
+     * also shows GPU time per frame (see the TIMER QUERIES comment below).
+     * V turns vsync off for benchmarking. Some drivers or desktop settings
+     * force vsync regardless (Mesa: vblank_mode=0 ./bin/demo overrides it). */
+    glfwSwapInterval(g_vsync);
 
     /* Print which GPU we got. Useful on hybrid laptops (see README: PRIME). */
     const char *gl_vendor   = (const char *)glGetString(GL_VENDOR);
@@ -500,6 +583,10 @@ int main(int argc, char **argv)
     /* ---- Shaders ----------------------------------------------------------- */
     GLint frag_len = (GLint)(_binary_shader_frag_end - _binary_shader_frag_start);
     GLuint prog = build_program(_binary_shader_frag_start, frag_len, "shader.frag (embedded)");
+    GLint post_len = (GLint)(_binary_post_frag_end - _binary_post_frag_start);
+    GLuint post = build_program(_binary_post_frag_start, post_len, "post.frag (embedded)");
+    if (!post) { glfwTerminate(); return 1; }
+    set_post_program(post);
     if (!prog) { glfwTerminate(); return 1; }
     use_program(prog);
     if (hud_init() != 0) fprintf(stderr, "HUD unavailable\n");
@@ -509,6 +596,21 @@ int main(int argc, char **argv)
     GLuint vao;
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
+
+    /* TIMER QUERIES: ask the GPU itself how long our drawing took.
+     * glBeginQuery(GL_TIME_ELAPSED) ... glEndQuery() brackets GPU work, and the
+     * GPU writes the elapsed nanoseconds into the query object when it
+     * finishes. The GPU runs a frame or two BEHIND the CPU, so asking for the
+     * result immediately would stall until the GPU catches up. Instead we keep
+     * a small ring of queries and read each one a few frames later, only when
+     * GL_QUERY_RESULT_AVAILABLE says it's ready. Core OpenGL since 3.3. */
+    enum { NQ = 4 };
+    GLuint gpu_q[NQ];
+    int    gpu_q_used[NQ] = {0};
+    glGenQueries(NQ, gpu_q);
+    unsigned frame_no = 0;
+    double gpu_ms = 0.0;                       /* smoothed average             */
+    double gpu_peak_ms = 0.0, gpu_peak_acc = 0.0; /* worst frame in the last second */
 
     /* ---- Audio ------------------------------------------------------------- *
      * Started after the window exists, so the music doesn't begin while the
@@ -534,7 +636,7 @@ int main(int argc, char **argv)
     long exe_bytes = stat("/proc/self/exe", &exe_st) == 0 ? (long)exe_st.st_size : 0;
 
     while (!glfwWindowShouldClose(win)) {
-        if (g_reload_requested) { g_reload_requested = 0; reload_shader_from_disk(); }
+        if (g_reload_requested) { g_reload_requested = 0; reload_shaders_from_disk(); }
 
         /* MASTER CLOCK: the music if we have it, the wall clock otherwise.
          * With audio: the estimated heard position, plus the (smoothed) ALSA
@@ -570,26 +672,74 @@ int main(int argc, char **argv)
          * screens, so always size the viewport from the framebuffer. */
         int fb_w, fb_h;
         glfwGetFramebufferSize(win, &fb_w, &fb_h);
-        glViewport(0, 0, fb_w, fb_h);
+        if (fb_w < 1 || fb_h < 1) { glfwPollEvents(); continue; } /* minimised */
+
+        /* Scene size = display size x render scale (at least 1 pixel). */
+        int rt_w = (int)(fb_w * SCALES[g_scale_idx]), rt_h = (int)(fb_h * SCALES[g_scale_idx]);
+        if (rt_w < 1) rt_w = 1;
+        if (rt_h < 1) rt_h = 1;
+        ensure_render_target(rt_w, rt_h);
 
         /* UNIFORMS: how time and resolution reach the shader. A uniform is a
          * read-only global variable for one draw call: every pixel sees the same
          * value. We set them right before drawing. The HUD uses its own program
          * and VAO, so re-bind ours every frame. */
-        glUseProgram(g_program);
         glBindVertexArray(vao);
-        glUniform2f(u_resolution, (float)fb_w, (float)fb_h);
+        glUseProgram(g_program);
+        glUniform2f(u_resolution, (float)rt_w, (float)rt_h);
         glUniform1f(u_time,       (float)t);
         glUniform1f(u_rain_time,  (float)rain_t);
         glUniform1f(u_beat,       (float)pulse);
         glUniform1f(u_beat_count, (float)beats);
 
-        /* No glClear needed: the triangle overwrites every pixel. */
+        /* Collect the oldest timer result if it's ready (never wait for it). */
+        int qi = frame_no % NQ;
+        if (gpu_q_used[qi]) {
+            GLint ready = 0;
+            glGetQueryObjectiv(gpu_q[qi], GL_QUERY_RESULT_AVAILABLE, &ready);
+            if (ready) {
+                GLuint64 ns = 0;
+                glGetQueryObjectui64v(gpu_q[qi], GL_QUERY_RESULT, &ns);
+                gpu_ms += (ns / 1e6 - gpu_ms) * 0.05;   /* smooth like frame_ms */
+                /* Averages hide spikes (virus hits are the heaviest
+                 * frames), so track the worst frame too. */
+                if (ns / 1e6 > gpu_peak_acc) gpu_peak_acc = ns / 1e6;
+            }
+        }
+
+        /* Both passes are timed, but not the HUD, so the number is the
+         * demo's own cost. No glClear needed: each full-screen triangle
+         * overwrites every pixel of its target. */
+        glBeginQuery(GL_TIME_ELAPSED, gpu_q[qi]);
+
+        /* PASS 1: the scene, into the off-screen texture. */
+        glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+        glViewport(0, 0, rt_w, rt_h);
         glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        /* PASS 2: post-processing, from the texture onto the window. The
+         * texture is bound to "texture unit 0", and the uScene sampler is
+         * told to read unit 0. */
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, fb_w, fb_h);
+        glUseProgram(g_post);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_scene_tex);
+        glUniform1i(p_scene, 0);
+        glUniform2f(p_resolution, (float)fb_w, (float)fb_h);
+        glUniform1f(p_time, (float)t);
+        glUniform1f(p_beat_count, (float)beats);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEndQuery(GL_TIME_ELAPSED);
+        gpu_q_used[qi] = 1;
+        frame_no++;
 
         if (g_hud_on) {
             HudInfo hi = {
-                .fps = fps, .frame_ms = frame_ms,
+                .fps = fps, .frame_ms = frame_ms, .gpu_ms = gpu_ms, .gpu_peak_ms = gpu_peak_ms,
+                .vsync = g_vsync, .fb_w = fb_w, .fb_h = fb_h,
+                .rt_w = rt_w, .rt_h = rt_h, .scale_pc = (int)(SCALES[g_scale_idx] * 100.0 + 0.5),
                 .gl_renderer = gl_renderer, .gl_version = gl_version,
                 .audio_source = wav ? wav : "procedural",
                 .audio_backend = audio_backend_name(),
@@ -622,6 +772,8 @@ int main(int argc, char **argv)
         if (now - fps_t0 >= 1.0) {
             fps = fps_frames / (now - fps_t0);
             read_memory(&mem_rss, &mem_anon, &mem_file, &mem_shmem); /* once a second is plenty */
+            gpu_peak_ms = gpu_peak_acc;
+            gpu_peak_acc = 0.0;
             char title[96];
             snprintf(title, sizeof title, "MATRIX RAIN // %.0f BPM // %d fps // beat %.0f%s",
                      g_bpm, (int)(fps_frames / (now - fps_t0) + 0.5), floor(beats),
@@ -638,6 +790,10 @@ int main(int argc, char **argv)
      * habit (and keeps tools like valgrind quiet). */
     audio_stop();
     hud_shutdown();
+    glDeleteQueries(NQ, gpu_q);
+    glDeleteFramebuffers(1, &g_fbo);
+    glDeleteTextures(1, &g_scene_tex);
+    glDeleteProgram(g_post);
     glDeleteVertexArrays(1, &vao);
     glDeleteProgram(g_program);
     glfwDestroyWindow(win);

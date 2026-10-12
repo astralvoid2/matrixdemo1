@@ -44,6 +44,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #define SR        DEMO_SAMPLE_RATE
 #define TAU       6.283185307179586
 #define BARS      8

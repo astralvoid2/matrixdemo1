@@ -1,6 +1,9 @@
 # Build products (recreated by `make`)
 /build/
 /bin/
+/.codex-temp/
+/out/
+/.tools/
 
 # Exported / user-supplied audio
 *.wav

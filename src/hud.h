@@ -7,6 +7,7 @@
  */
 #ifndef HUD_H
 #define HUD_H
+#include <stdint.h>
 
 typedef struct {
     double      fps, frame_ms;
@@ -18,12 +19,12 @@ typedef struct {
     const char *audio_source;   /* "procedural" or the WAV file name, or NULL */
     const char *audio_backend;
     unsigned    audio_rate;     /* Hz, 0 = no audio */
-    double      alsa_delay_ms;  /* what ALSA reports as queued */
+    double      audio_delay_ms; /* queued audio reported by the backend */
     double      auto_sync_ms;   /* automatic part: minus the smoothed ALSA delay */
     double      sync_ms;        /* the user's trim on top (+ = visuals later)   */
     const char *sync_source;    /* "default", "saved" or "--sync-ms"            */
     long        rss_kb, anon_kb, file_kb, shmem_kb;  /* from /proc/self/status */
-    long        exe_bytes;      /* size of the executable file                  */
+    uint64_t    exe_bytes;      /* size of the executable file                  */
     int         muted;
     double      bpm, beats;     /* beats = the beat position the VISUALS use */
     int         other_gpu;      /* 1 if G can switch to another GPU */

@@ -16,9 +16,7 @@
  * text. A bitmap font is also very "demoscene".
  */
 #define _GNU_SOURCE
-#define GL_GLEXT_PROTOTYPES
-#define GLFW_INCLUDE_GLEXT
-#include <GLFW/glfw3.h>
+#include "gl_api.h"
 
 #include "hud.h"
 
@@ -205,12 +203,18 @@ void hud_draw(const HudInfo *in, int fb_w, int fb_h)
      * "shm" shared memory (GPU drivers keep buffers there). */
     c = text(0, r, DIM, "MEM   ");
     c = text(c, r, HI, "%5.1f MB", in->rss_kb / 1024.0);
+#ifdef _WIN32
+    /* Windows reports working set and private committed memory. */
+    c = text(c, r, DIM, "  private commit ");
+    text(c, r++, MID, "%.1f MB", in->anon_kb / 1024.0);
+#else
     c = text(c, r, DIM, "  own ");
     c = text(c, r, MID, "%.1f", in->anon_kb / 1024.0);
     c = text(c, r, DIM, "  libs ");
     c = text(c, r, MID, "%.1f", in->file_kb / 1024.0);
     c = text(c, r, DIM, "  shm ");
     text(c, r++, MID, "%.1f", in->shmem_kb / 1024.0);
+#endif
 
     c = text(0, r, DIM, "GPU   ");
     text(c, r++, HI, "%.58s", in->gl_renderer ? in->gl_renderer : "?");
@@ -223,7 +227,7 @@ void hud_draw(const HudInfo *in, int fb_w, int fb_h)
         if (in->muted) text(c, r, HI, "  MUTED");
         r++;
         c = text(0, r, DIM, "      ");
-        text(c, r++, MID, "%.36s  delay %3.0f ms", in->audio_backend, in->alsa_delay_ms);
+        text(c, r++, MID, "%.36s  queue %3.0f ms", in->audio_backend, in->audio_delay_ms);
     } else {
         text(c, r++, MID, "off (wall clock)");
         r++;

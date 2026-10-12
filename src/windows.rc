@@ -1,0 +1,2 @@
+// Embed the same Windows settings when using a GNU-compatible toolchain.
+1 24 "windows.manifest"

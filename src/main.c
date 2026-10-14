@@ -1,5 +1,5 @@
 /*
- * main.c — "MATRIX RAIN", a 4K-intro-style audiovisual demo for Linux.
+ * main.c — "MATRIX RAIN", a 4K-intro-style audiovisual demo for Linux and Windows.
  *
  * WHAT HAPPENS, IN ORDER
  *   1. Parse command-line options (custom WAV, BPM, fullscreen...).
@@ -40,19 +40,19 @@
  *     still use a loader; this is the simpler Linux path.
  */
 #define _GNU_SOURCE
-#define GL_GLEXT_PROTOTYPES   /* declare glCreateShader & co. (see notes above) */
-#define GLFW_INCLUDE_GLEXT    /* make GLFW also include <GL/glext.h>           */
-#include <GLFW/glfw3.h>
+#include "gl_api.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include "audio.h"
 #include "hud.h"
+#include "platform.h"
 #include "synth.h"
 
 /* -------------------------------------------------------------------------
@@ -63,10 +63,14 @@
  * these two symbols marking the start and end of the data. (Not
  * NUL-terminated! That's why we pass an explicit length to glShaderSource.)
  * ------------------------------------------------------------------------- */
+#ifdef DEMO_EMBEDDED_C
+#include "embedded_shaders.h"
+#else
 extern const char _binary_shader_frag_start[];
 extern const char _binary_shader_frag_end[];
 extern const char _binary_post_frag_start[];   /* post.frag, embedded the same way */
 extern const char _binary_post_frag_end[];
+#endif
 
 /* Vertex shader: generates the 3 corners of the full-screen triangle.
  *   gl_VertexID = 0 -> (0,0) -> clip (-1,-1)   bottom-left
@@ -110,18 +114,20 @@ static int g_fullscreen;
 static int g_win_x, g_win_y, g_win_w = 1280, g_win_h = 720; /* saved windowed geometry */
 static int g_reload_requested;
 static int g_hud_on;              /* H toggles the overlay                        */
+#ifndef _WIN32
 static int g_switch_gpu;          /* G: quit and relaunch on the other GPU         */
+#endif
 static int g_vsync = 1;           /* V toggles. See the VSYNC comment in main()    */
 
 /* SYNC. The visual clock is
- *     audio_time() + audio_smoothed_delay() - g_sync
- * The middle term is AUTOMATIC: it follows whatever latency ALSA reports, so
- * speakers and Bluetooth headphones both line up without any setup (see
- * audio.c for how this was found). g_sync is a personal TRIM on top,
+ *     audio_time() + audio_visual_lead() - g_sync
+ * Linux retains its measured ALSA compensation. Windows follows the WASAPI
+ * device clock without adding that Linux-specific compensation. The queued
+ * audio delay is displayed separately. g_sync is a personal TRIM on top,
  * in seconds (positive = visuals later). Where it comes from, highest
  * priority first:
  *   --sync-ms N    command line
- *   saved          ~/.config/matrixrain/sync_trim_ms, written on every [ or ]
+ *   saved          platform's per-user MatrixRain directory, written on [ or ]
  *   default        0
  * Backspace forgets the saved trim. */
 static double      g_sync;
@@ -134,31 +140,16 @@ static const char *g_sync_source = "default";
  * keeps the parsing trivial. */
 static int sync_file_path(char *buf, size_t len, int make_dir)
 {
-    const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
-    char dir[512];
-    if (xdg && *xdg)  snprintf(dir, sizeof dir, "%s/matrixrain", xdg);
-    else if (home)    snprintf(dir, sizeof dir, "%s/.config/matrixrain", home);
-    else              return -1;
-    if (make_dir) {
-        /* mkdir fails harmlessly if it already exists. ~/.config itself may
-         * be missing on a fresh account, so create the parent first. */
-        char parent[512];
-        snprintf(parent, sizeof parent, "%s", dir);
-        char *slash = strrchr(parent, '/');
-        if (slash) { *slash = '\0'; mkdir(parent, 0755); }
-        mkdir(dir, 0755);
-    }
     /* "trim" in the name: an older version saved an ABSOLUTE offset as
      * sync_ms. A new name means that value is never misread as a trim. */
-    snprintf(buf, len, "%s/sync_trim_ms", dir);
-    return 0;
+    return platform_data_path(buf, len, "sync_trim_ms", make_dir);
 }
 
 static int load_saved_sync(double *sec)
 {
-    char path[600];
+    char path[DEMO_PATH_CAPACITY];
     if (sync_file_path(path, sizeof path, 0) != 0) return 0;
-    FILE *f = fopen(path, "r");
+    FILE *f = platform_fopen(path, "r");
     if (!f) return 0;
     double ms;
     int ok = fscanf(f, "%lf", &ms) == 1;
@@ -169,9 +160,9 @@ static int load_saved_sync(double *sec)
 
 static void save_sync(void)
 {
-    char path[600];
+    char path[DEMO_PATH_CAPACITY];
     if (sync_file_path(path, sizeof path, 1) != 0) return;
-    FILE *f = fopen(path, "w");
+    FILE *f = platform_fopen(path, "w");
     if (!f) { perror(path); return; }
     fprintf(f, "%.0f\n", g_sync * 1000.0);
     fclose(f);
@@ -179,8 +170,8 @@ static void save_sync(void)
 
 static void forget_saved_sync(void)
 {
-    char path[600];
-    if (sync_file_path(path, sizeof path, 0) == 0) unlink(path);
+    char path[DEMO_PATH_CAPACITY];
+    if (sync_file_path(path, sizeof path, 0) == 0) platform_remove_file(path);
 }
 
 /* ---- Memory use, from the kernel ----
@@ -194,17 +185,7 @@ static void forget_saved_sync(void)
  * Note that VRAM on a discrete GPU isn't counted, since it's not in system RAM. */
 static void read_memory(long *rss, long *anon, long *file, long *shmem)
 {
-    *rss = *anon = *file = *shmem = 0;
-    FILE *f = fopen("/proc/self/status", "r");
-    if (!f) return;
-    char line[256];
-    while (fgets(line, sizeof line, f)) {
-        sscanf(line, "VmRSS: %ld", rss);
-        sscanf(line, "RssAnon: %ld", anon);
-        sscanf(line, "RssFile: %ld", file);
-        sscanf(line, "RssShmem: %ld", shmem);
-    }
-    fclose(f);
+    platform_read_memory(rss, anon, file, shmem);
 }
 
 /* [ / ] handler: adjust, remember, report. */
@@ -306,8 +287,8 @@ static GLuint build_from_disk(const char *name)
 {
     char path[256];
     snprintf(path, sizeof path, "src/%s", name);
-    FILE *f = fopen(path, "rb");
-    if (!f) f = fopen(strcpy(path, name), "rb");
+    FILE *f = platform_fopen(path, "rb");
+    if (!f) f = platform_fopen(strcpy(path, name), "rb");
     if (!f) { fprintf(stderr, "reload: src/%s not found (run from the repo root)\n", name); return 0; }
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
@@ -404,7 +385,13 @@ static void on_key(GLFWwindow *win, int key, int scancode, int action, int mods)
         g_sync_source = "default";
         fprintf(stderr, "sync trim: reset to 0\n");
         break;
-    case GLFW_KEY_G:   g_switch_gpu = 1; glfwSetWindowShouldClose(win, GLFW_TRUE); break;
+    case GLFW_KEY_G:
+#ifdef _WIN32
+        fprintf(stderr, "GPU preference: Windows Settings > System > Display > Graphics, then restart.\n");
+#else
+        g_switch_gpu = 1; glfwSetWindowShouldClose(win, GLFW_TRUE);
+#endif
+        break;
     case GLFW_KEY_V:   g_vsync = !g_vsync; glfwSwapInterval(g_vsync); break;
     }
 }
@@ -427,6 +414,7 @@ static void on_glfw_error(int code, const char *msg)
  * replaced by a fresh copy that picks the other GPU. The music restarts.
  * The HUD/fullscreen/sync state is passed along as command-line options.
  * ------------------------------------------------------------------------- */
+#ifndef _WIN32
 static void relaunch_on_other_gpu(char **argv, int on_nvidia)
 {
     /* MATRIXRAIN_GPU_SWITCH marks "we were relaunched onto NVIDIA", so that if
@@ -476,6 +464,7 @@ static void relaunch_on_other_gpu(char **argv, int on_nvidia)
     execv("/proc/self/exe", args);    /* only returns on failure */
     perror("execv");
 }
+#endif
 
 /* ------------------------------------------------------------------------- */
 static void usage(const char *argv0)
@@ -494,20 +483,25 @@ static void usage(const char *argv0)
            "  --export FILE.wav   write the built-in track to a WAV file and exit\n"
            "keys: ESC/Q quit, F/F11 fullscreen, M mute, R reload shaders,\n"
            "      H HUD, V vsync, S render scale, [ ] sync trim -/+ 10 ms (remembered),\n"
-           "      Backspace trim 0, G relaunch on the other GPU\n",
+           "      Backspace trim 0"
+#ifndef _WIN32
+           ", G relaunch on the other GPU"
+#endif
+           "\n",
            argv0, DEMO_BPM);
 }
 
-int main(int argc, char **argv)
+int demo_main(int argc, char **argv)
 {
     const char *wav = NULL;
-    int nosound = 0, start_fullscreen = 0;
+    int nosound = 0, start_fullscreen = 0, smoke_test = 0, exit_code = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         int more = i + 1 < argc;
         if      (!strcmp(a, "--fullscreen"))       start_fullscreen = 1;
         else if (!strcmp(a, "--nosound"))          nosound = 1;
+        else if (!strcmp(a, "--smoke-test"))       { smoke_test = 1; nosound = 1; }
         else if (!strcmp(a, "--hud"))              g_hud_on = 1;
         else if (!strcmp(a, "--novsync"))          g_vsync = 0;
         else if (!strcmp(a, "--scale") && more)    { int pc = atoi(argv[++i]);
@@ -535,12 +529,18 @@ int main(int argc, char **argv)
     /* No depth/stencil buffer: we draw one flat triangle and never test depth. */
     glfwWindowHint(GLFW_DEPTH_BITS, 0);
     glfwWindowHint(GLFW_STENCIL_BITS, 0);
+    if (smoke_test) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
     GLFWwindow *win = glfwCreateWindow(g_win_w, g_win_h, "MATRIX RAIN // 128 BPM", NULL, NULL);
     if (!win) {
         fprintf(stderr, "Could not create an OpenGL 3.3 core window.\n"
+#ifdef _WIN32
+                        "Install the Intel, AMD or NVIDIA graphics driver; OpenGL 3.3 is required.\n");
+#else
                         "Check `glxinfo -B` (package mesa-utils) for your GL version.\n");
+#endif
         glfwTerminate();
+#ifndef _WIN32
         if (getenv("MATRIXRAIN_GPU_SWITCH")) {
             /* We got here by pressing G. The usual cause: the NVIDIA driver was
              * updated but not yet reloaded (`nvidia-smi` then says
@@ -550,9 +550,18 @@ int main(int argc, char **argv)
             g_fullscreen = start_fullscreen;
             relaunch_on_other_gpu(argv, 1);
         }
+#endif
         return 1;
     }
     glfwMakeContextCurrent(win);  /* GL calls on this thread now go to this context */
+#ifdef DEMO_USE_GLAD
+    if (!gladLoadGL((GLADloadfunc)glfwGetProcAddress) || !GLAD_GL_VERSION_3_3) {
+        fprintf(stderr, "Could not load the required OpenGL 3.3 functions.\n");
+        glfwDestroyWindow(win);
+        glfwTerminate();
+        return 1;
+    }
+#endif
     glfwSetKeyCallback(win, on_key);
 
     /* VSYNC: wait for the monitor's vertical blank before swapping. That caps
@@ -575,16 +584,27 @@ int main(int argc, char **argv)
     /* Is there another GPU we could switch to with G? If we're on NVIDIA, the
      * integrated GPU (Mesa) is always there. If we're on Mesa, an NVIDIA GPU is
      * usable when its kernel driver is loaded (this /proc file exists). */
+#ifdef _WIN32
+    int other_gpu = 0; /* GPU selection is a Windows per-application preference. */
+#else
     int on_nvidia = gl_vendor && strstr(gl_vendor, "NVIDIA") != NULL;
     int other_gpu = on_nvidia || access("/proc/driver/nvidia/version", F_OK) == 0;
+#endif
 
     if (start_fullscreen) toggle_fullscreen(win);
 
     /* ---- Shaders ----------------------------------------------------------- */
+#ifdef DEMO_EMBEDDED_C
+    GLint frag_len = (GLint)(sizeof embedded_shader - 1);
+    GLuint prog = build_program((const char *)embedded_shader, frag_len, "shader.frag (embedded)");
+    GLint post_len = (GLint)(sizeof embedded_post - 1);
+    GLuint post = build_program((const char *)embedded_post, post_len, "post.frag (embedded)");
+#else
     GLint frag_len = (GLint)(_binary_shader_frag_end - _binary_shader_frag_start);
     GLuint prog = build_program(_binary_shader_frag_start, frag_len, "shader.frag (embedded)");
     GLint post_len = (GLint)(_binary_post_frag_end - _binary_post_frag_start);
     GLuint post = build_program(_binary_post_frag_start, post_len, "post.frag (embedded)");
+#endif
     if (!post) { glfwTerminate(); return 1; }
     set_post_program(post);
     if (!prog) { glfwTerminate(); return 1; }
@@ -621,7 +641,12 @@ int main(int argc, char **argv)
     }
     /* Default visual delay: whatever latency the audio layer can't report. */
     if (!g_sync_given && load_saved_sync(&g_sync)) g_sync_source = "saved";
-    fprintf(stderr, "sync: auto (follows ALSA delay), trim %+.0f ms (%s; [ / ] to adjust)\n",
+    fprintf(stderr, "sync: %s, trim %+.0f ms (%s; [ / ] to adjust)\n",
+#ifdef _WIN32
+            "WASAPI device clock",
+#else
+            "auto (follows ALSA delay)",
+#endif
             g_sync * 1000.0, g_sync_source);
     double wall_start = glfwGetTime();
 
@@ -631,9 +656,7 @@ int main(int argc, char **argv)
     int    fps_frames = 0;
     long   mem_rss = 0, mem_anon = 0, mem_file = 0, mem_shmem = 0;
 
-    /* The size of our own executable: /proc/self/exe is a link to it. */
-    struct stat exe_st;
-    long exe_bytes = stat("/proc/self/exe", &exe_st) == 0 ? (long)exe_st.st_size : 0;
+    uint64_t exe_bytes = platform_executable_size();
 
     while (!glfwWindowShouldClose(win)) {
         if (g_reload_requested) { g_reload_requested = 0; reload_shaders_from_disk(); }
@@ -643,7 +666,7 @@ int main(int argc, char **argv)
          * delay, minus the user's trim. See the SYNC comment at the top. */
         double t = audio_time();
         if (t < 0.0) t = glfwGetTime() - wall_start;
-        else         t += audio_smoothed_delay() - g_sync;
+        else         t += audio_visual_lead() - g_sync;
 
         /* BEAT SYNC. The whole approach in three lines:
          *   beats = seconds * BPM / 60              e.g. 128 BPM is 2.133 beats/s
@@ -735,6 +758,25 @@ int main(int argc, char **argv)
         gpu_q_used[qi] = 1;
         frame_no++;
 
+        if (smoke_test && frame_no >= 8) {
+            /* Hidden-window integration check: compile the embedded shaders,
+             * render both passes and verify actual RGB output and GL errors. */
+            size_t bytes = (size_t)fb_w * (size_t)fb_h * 4;
+            unsigned char *pixels = malloc(bytes);
+            uint64_t rgb_sum = 0;
+            if (pixels) {
+                glReadPixels(0, 0, fb_w, fb_h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+                for (size_t i = 0; i < bytes; i += 4)
+                    rgb_sum += pixels[i] + pixels[i + 1] + pixels[i + 2];
+            }
+            GLenum error = glGetError();
+            exit_code = !pixels || !rgb_sum || error != GL_NO_ERROR;
+            fprintf(stderr, "render smoke test: %s (%dx%d, RGB sum %llu, GL error 0x%x)\n",
+                    exit_code ? "FAILED" : "PASS", fb_w, fb_h, (unsigned long long)rgb_sum, error);
+            free(pixels);
+            glfwSetWindowShouldClose(win, GLFW_TRUE);
+        }
+
         if (g_hud_on) {
             HudInfo hi = {
                 .fps = fps, .frame_ms = frame_ms, .gpu_ms = gpu_ms, .gpu_peak_ms = gpu_peak_ms,
@@ -744,9 +786,9 @@ int main(int argc, char **argv)
                 .audio_source = wav ? wav : "procedural",
                 .audio_backend = audio_backend_name(),
                 .audio_rate = audio_rate(),
-                .alsa_delay_ms = audio_reported_delay() * 1000.0,
+                .audio_delay_ms = audio_reported_delay() * 1000.0,
                 .sync_ms = g_sync * 1000.0,
-                .auto_sync_ms = -audio_smoothed_delay() * 1000.0,
+                .auto_sync_ms = -audio_visual_lead() * 1000.0,
                 .rss_kb = mem_rss, .anon_kb = mem_anon, .file_kb = mem_file, .shmem_kb = mem_shmem,
                 .exe_bytes = exe_bytes,
                 .sync_source = g_sync_source,
@@ -755,7 +797,7 @@ int main(int argc, char **argv)
                 .other_gpu = other_gpu,
             };
             /* Show only the file name of a WAV path, not the directories. */
-            if (wav && strrchr(wav, '/')) hi.audio_source = strrchr(wav, '/') + 1;
+            if (wav) hi.audio_source = platform_basename(wav);
             hud_draw(&hi, fb_w, fb_h);
         }
 
@@ -799,6 +841,8 @@ int main(int argc, char **argv)
     glfwDestroyWindow(win);
     glfwTerminate();
 
+#ifndef _WIN32
     if (g_switch_gpu && other_gpu) relaunch_on_other_gpu(argv, on_nvidia);
-    return 0;
+#endif
+    return exit_code;
 }

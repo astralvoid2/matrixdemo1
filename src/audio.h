@@ -1,5 +1,5 @@
 /*
- * audio.h — ALSA playback of a looping stereo buffer, plus a precise
+ * audio.h — ALSA/WASAPI playback of a looping stereo buffer, plus a precise
  *           "how many seconds of music has the listener actually heard" clock.
  *
  * Why a music clock rather than the wall clock?
@@ -25,12 +25,16 @@ int    audio_start_wav(const char *path);
  * fall back to a wall clock). */
 double audio_time(void);
 
-/* Queue length ALSA last reported, in seconds (for display). <0 if no audio. */
+/* Queue length the backend last reported, in seconds. <0 if no audio.
+ * Endpoint buffering is not a measurement of Bluetooth/display latency. */
 double audio_reported_delay(void);
 
-/* The ALSA delay, smoothed (seconds; 0 if no audio). The visuals run this
- * far AHEAD of audio_time(). See audio.c for why. */
+/* Smoothed queue length in seconds; 0 if no audio. */
 double audio_smoothed_delay(void);
+
+/* Platform-specific visual lead: ALSA queue compensation on Linux, zero on
+ * Windows, where the visuals follow the WASAPI device clock plus user trim. */
+double audio_visual_lead(void);
 
 const char *audio_backend_name(void);   /* short description for the HUD */
 unsigned    audio_rate(void);           /* sample rate in Hz, 0 if no audio */

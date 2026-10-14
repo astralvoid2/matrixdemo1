@@ -1,4 +1,4 @@
-# MATRIX RAIN: a 4K-intro-style demo for Linux
+# MATRIX RAIN: a 4K-intro-style demo for Windows and Linux
 
 ![Matrix digital rain with the HUD open (executable size, FPS, memory, GPU, audio delay and auto-sync, beat and phrase meters) as a red virus outbreak breaks up into scattered blocks](docs/screenshot.png)
 
@@ -10,9 +10,9 @@ synthesised from scratch at startup. No textures, no fonts, no sample files:
 just math.
 
 The code is written to be **read**. Every file is commented for learning,
-explaining the shader math, the timing, OpenGL setup on Linux, and audio.
+explaining the shader math, the timing, OpenGL setup, and audio.
 
-## Download (no build needed)
+## Linux downloads (no build needed)
 
 **[⬇ Get the latest release](https://github.com/astralvoid2/matrixdemo1/releases/latest)**: a single ~75 KB executable for x86-64 Linux.
 
@@ -31,7 +31,72 @@ Each file was built in a clean container of that Ubuntu release. `SHA256SUMS`
 on the release page lets you verify the download (`sha256sum -c SHA256SUMS`).
 Other distros: build from source below (it takes seconds).
 
-## Build & run (Ubuntu 22.04 / 24.04 or newer)
+## Build & run on Windows 11 (native x64)
+
+From PowerShell in this directory:
+
+```powershell
+.\Build-Windows.ps1 -Test
+.\bin\matrixrain.exe
+```
+
+The normal build uses **Visual Studio 2022's Desktop development with C++**
+workload, including MSVC v143 and a Windows SDK. The helper loads the x64
+compiler environment automatically; a Developer Command Prompt is optional.
+If the compiler installation is incomplete, modify/repair that workload in
+Visual Studio Installer, or use the portable compiler instead:
+
+```powershell
+.\Build-Windows.ps1 -PortableCompiler -Test
+.\bin\matrixrain.exe
+```
+
+The portable build downloads pinned **Zig 0.14.1** (Clang and the Windows C
+toolchain) and **Ninja 1.12.1** into `.tools`. It needs neither MSVC nor a
+separate Windows SDK installation. Both build paths use **CMake**; the helper
+uses an installed copy or downloads portable CMake 3.31.8 into `.tools`.
+The first configure downloads **GLFW 3.4**, including its generated GLAD
+OpenGL loader. Downloads are checked against pinned SHA256 hashes.
+Build tools are kept in the repository and nothing is installed system-wide.
+Internet access to GitHub (and ziglang.org for the portable compiler) is
+needed for the first download.
+
+The outputs are `bin/matrixrain.exe` (GUI) and `bin/matrixrain-console.exe`
+(console diagnostics and command-line tools). GLFW and the shaders are
+embedded; the release executables use only Windows system DLLs. Copy the
+GUI executable wherever you want to run it. Shader hot reload still needs
+the source files, so run from the repository when using `R`.
+
+```powershell
+.\bin\matrixrain-console.exe --help
+.\bin\matrixrain-console.exe --export .\track.wav
+.\bin\matrixrain-console.exe --wav .\track.wav --bpm 128 --hud
+.\bin\matrixrain-console.exe --nosound --hud
+```
+
+Windows-specific behavior:
+
+* Audio uses native **WASAPI shared mode**, mixing alongside other apps.
+  The visual clock follows the device's playback position, with the existing
+  `[`, `]`, `Backspace`, and `--sync-ms` controls for personal trim. The HUD
+  shows endpoint queue length; this is not the complete Bluetooth/display
+  latency. The Linux ALSA-specific visual lead is not applied on Windows.
+* The default audio output is selected at startup. Restart after changing
+  outputs or unplugging a device. If audio cannot start, rendering continues
+  silently; `--nosound` explicitly uses the wall clock.
+* Settings live in `%LOCALAPPDATA%\MatrixRain\sync_trim_ms`. When launched
+  without a terminal, diagnostics go to `matrixrain.log` in the same folder.
+* The memory HUD shows working set and private committed memory on Windows.
+* GPU preference is selected in **Settings → System → Display → Graphics**
+  for the executable, followed by a restart. Linux's `G` relaunch behavior is
+  kept on Linux; on Windows `G` prints this guidance without exiting.
+* Install the Intel/AMD/NVIDIA graphics driver for **OpenGL 3.3 core** support.
+  WSL is not required.
+
+For configuration flags, an offline GLFW checkout, raw CMake commands and
+the verification steps, see [the Windows build guide](docs/Windows-Build.md).
+
+## Build & run on Linux (Ubuntu 22.04 / 24.04 or newer)
 
 ```sh
 sudo apt install build-essential pkg-config libglfw3-dev libgl1-mesa-dev libasound2-dev
@@ -63,7 +128,7 @@ inside it, so it can be copied anywhere.
 | `S`          | render scale: cycle 100% / 75% / 50% (draw the scene smaller, stretch it to the screen) |
 | `[` / `]`    | personal sync trim -/+ 10 ms on top of the automatic sync (hold to sweep). **Remembered** between runs |
 | `Backspace`  | reset the trim to 0                                        |
-| `G`          | relaunch on the other GPU (Intel/AMD and NVIDIA, see below) |
+| `G`          | Linux: relaunch on the other GPU; Windows: print GPU-preference guidance |
 
 ### Command-line options
 
@@ -83,7 +148,9 @@ make track                       same as above, writes ./track.wav
 
 ```
 .
-├── Makefile            build rules
+├── Makefile            original Linux build rules
+├── CMakeLists.txt      Windows/Linux build; pinned GLFW and GLAD
+├── Build-Windows.ps1   MSVC or portable x64 build helper
 ├── README.md
 ├── LICENSE
 ├── docs/screenshot.png   README image
@@ -93,9 +160,15 @@ make track                       same as above, writes ./track.wav
 │   ├── post.frag       pass 2: RGB split, vignette, scanlines, grain, tone mapping
 │   ├── synth.c/.h      procedural music (BPM is defined in synth.h)
 │   ├── hud.c/.h        text overlay (H): bitmap font, CPU canvas, blend pass
-│   └── audio.c/.h      ALSA playback thread, music clock, WAV load/save
-├── build/              object files      (generated by make, not committed)
-└── bin/demo            the executable    (generated by make, not committed)
+│   ├── audio.c         Linux ALSA playback thread and clock
+│   ├── audio_win32.c   Windows WASAPI playback thread and device clock
+│   ├── audio_common.c  shared synthesis and WAV load/save
+│   ├── audio.h         platform-neutral audio API
+│   ├── platform.c/.h   settings paths, UTF-8 files, process/executable stats
+│   ├── console_entry.c Linux and Windows console entry point
+│   └── win32_entry.c   Windows GUI entry point
+├── build/              build products    (generated, not committed)
+└── bin/                native executables (generated, not committed)
 ```
 
 | File               | What's inside                                                         |
@@ -104,7 +177,9 @@ make track                       same as above, writes ./track.wav
 | `src/shader.frag`  | Pass 1, the scene: integer hashes, stateless drop/reset logic, procedural 5x7 glyphs, glow, beat hits, virus, glitch. Renders into an HDR texture |
 | `src/post.frag`    | Pass 2, screen-space effects: RGB split, vignette, scanlines, film grain, tone mapping |
 | `src/synth.c/.h`   | Procedural music: kick, clap, hats, rolling bass, pad, arp + delay, sidechain pumping |
-| `src/audio.c/.h`   | ALSA playback thread, latency-corrected music clock, WAV loader/writer |
+| `src/audio.c`, `src/audio_win32.c` | Linux ALSA / Windows WASAPI playback and audio clocks |
+| `src/audio_common.c` | Shared procedural rendering and WAV loader/writer |
+| `src/platform.c/.h` | Per-user settings paths, Unicode file support and process statistics |
 | `src/hud.c/.h`     | HUD overlay: 5x7 bitmap font drawn into a texture, composited with a second tiny shader |
 | `Makefile`         | Build rules, including embedding `shader.frag` with `ld -r -b binary` |
 
@@ -136,6 +211,10 @@ make track                       same as above, writes ./track.wav
   section.
 
 ### Sync: which point in the audio chain the visuals follow
+
+This section describes the existing **Linux/ALSA** compensation. Windows
+follows the WASAPI device clock minus your saved trim; see the Windows
+build section above for its queue and output-switching behavior.
 
 `snd_pcm_delay()` reports how much audio is queued between the demo and the
 output: about **70 ms** on the laptop speakers here, and about **240 ms** on
@@ -303,7 +382,7 @@ The most portable option is still the source: `git clone` + `make` takes
 seconds. For sharing a ready-made binary, attach it to a GitHub Release
 together with the one-line `apt install` above.
 
-## GPU selection (hybrid laptops), drivers and display servers
+## Linux GPU selection (hybrid laptops), drivers and display servers
 
 The demo uses plain OpenGL 3.3 core, which every Intel, AMD and NVIDIA GPU
 from roughly 2010 onwards supports. At startup it prints `GL_RENDERER`, so you
@@ -364,7 +443,7 @@ falls back to the integrated GPU.
 | Integrating speed instead of `time * speed`    | `main.c`, RAIN TIME comment                    |
 | Audio latency & the music clock                | `audio.c`, `audio_thread()` and `audio_time()` |
 | Audio/visual sync: auto delay + trim           | `audio.c` `audio_smoothed_delay()`, `main.c` SYNC + MASTER CLOCK |
-| Reading your own memory use from `/proc`       | `main.c`, `read_memory()`                      |
+| Reading memory use from `/proc` or Windows process counters | `platform.c`, `platform_read_memory()` |
 | Vsync, and timing the GPU with timer queries   | `main.c`, VSYNC and TIMER QUERIES comments     |
 | Render-to-texture (FBO), two passes, render scale | `main.c` RENDER TARGET, `post.frag` header  |
 | Saving settings the Linux way (XDG config dir) | `main.c`, `sync_file_path()`                   |

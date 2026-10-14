@@ -17,7 +17,7 @@ BUILD_DIR := build
 BIN_DIR   := bin
 TARGET    := $(BIN_DIR)/demo
 
-SRCS    := $(wildcard $(SRC_DIR)/*.c)
+SRCS    := $(addprefix $(SRC_DIR)/,main.c console_entry.c hud.c synth.c audio.c audio_common.c platform.c)
 OBJS    := $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o) $(BUILD_DIR)/shader_frag.o $(BUILD_DIR)/post_frag.o
 HEADERS := $(wildcard $(SRC_DIR)/*.h)
 
